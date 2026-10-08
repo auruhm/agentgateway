@@ -771,7 +771,12 @@ async fn multiplex_never_prefix_renames_colliding_tools_via_overrides() {
 	.unwrap();
 	let merge = relay.merge_tools();
 
-	let schema = Arc::new(serde_json::json!({ "type": "object" }).as_object().cloned().unwrap());
+	let schema = Arc::new(
+		serde_json::json!({ "type": "object" })
+			.as_object()
+			.cloned()
+			.unwrap(),
+	);
 	let listed = |target: &str| -> (Strng, ServerResult) {
 		(
 			strng::new(target),

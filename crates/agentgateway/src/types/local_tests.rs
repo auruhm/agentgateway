@@ -1697,10 +1697,7 @@ mcp:
 	)
 	.await
 	.expect_err("duplicate (target, source) pairs should be rejected");
-	assert!(
-		err.to_string().contains("duplicate source"),
-		"{err:?}"
-	);
+	assert!(err.to_string().contains("duplicate source"), "{err:?}");
 }
 
 #[tokio::test]

@@ -680,6 +680,7 @@
 |`binds[].listeners[].routes[].backends[].mcp.toolNameOverrides[].target`|string|Target this override applies to (same namespace as `mcp.targets[].name`).|
 |`binds[].listeners[].routes[].backends[].mcp.toolNameOverrides[].source`|string|Tool name as served by the upstream.|
 |`binds[].listeners[].routes[].backends[].mcp.toolNameOverrides[].name`|string|Client-facing tool name.|
+|`binds[].listeners[].routes[].backends[].mcp.lazyTools`|boolean|Expose the aggregated tool catalog lazily: `tools/list` advertises only two<br>gateway tools, `mcp_search` (find tools by name or purpose) and `mcp_call`<br>(invoke a tool found via `mcp_search`). Direct calls to upstream tool names<br>keep working, so enabling this only changes discovery, never capability.|
 |`binds[].listeners[].routes[].backends[].ai`|object||
 |`binds[].listeners[].routes[].backends[].ai.name`|string|Name identifying this provider, referenced by `llm.models[].provider`.|
 |`binds[].listeners[].routes[].backends[].ai.provider`|object|The upstream LLM provider type and its configuration.<br>Exactly one of openAI, gemini, vertex, anthropic, bedrock, azure, copilot, or custom may be set.|
@@ -2237,6 +2238,7 @@
 |`backends[].mcp.toolNameOverrides[].target`|string|Target this override applies to (same namespace as `mcp.targets[].name`).|
 |`backends[].mcp.toolNameOverrides[].source`|string|Tool name as served by the upstream.|
 |`backends[].mcp.toolNameOverrides[].name`|string|Client-facing tool name.|
+|`backends[].mcp.lazyTools`|boolean|Expose the aggregated tool catalog lazily: `tools/list` advertises only two<br>gateway tools, `mcp_search` (find tools by name or purpose) and `mcp_call`<br>(invoke a tool found via `mcp_search`). Direct calls to upstream tool names<br>keep working, so enabling this only changes discovery, never capability.|
 |`backends[].ai`|object||
 |`backends[].ai.name`|string|Name identifying this provider, referenced by `llm.models[].provider`.|
 |`backends[].ai.provider`|object|The upstream LLM provider type and its configuration.<br>Exactly one of openAI, gemini, vertex, anthropic, bedrock, azure, copilot, or custom may be set.|
@@ -3374,6 +3376,7 @@
 |`routeGroups[].routes[].backends[].mcp.toolNameOverrides[].target`|string|Target this override applies to (same namespace as `mcp.targets[].name`).|
 |`routeGroups[].routes[].backends[].mcp.toolNameOverrides[].source`|string|Tool name as served by the upstream.|
 |`routeGroups[].routes[].backends[].mcp.toolNameOverrides[].name`|string|Client-facing tool name.|
+|`routeGroups[].routes[].backends[].mcp.lazyTools`|boolean|Expose the aggregated tool catalog lazily: `tools/list` advertises only two<br>gateway tools, `mcp_search` (find tools by name or purpose) and `mcp_call`<br>(invoke a tool found via `mcp_search`). Direct calls to upstream tool names<br>keep working, so enabling this only changes discovery, never capability.|
 |`routeGroups[].routes[].backends[].ai`|object||
 |`routeGroups[].routes[].backends[].ai.name`|string|Name identifying this provider, referenced by `llm.models[].provider`.|
 |`routeGroups[].routes[].backends[].ai.provider`|object|The upstream LLM provider type and its configuration.<br>Exactly one of openAI, gemini, vertex, anthropic, bedrock, azure, copilot, or custom may be set.|
@@ -4998,6 +5001,7 @@
 |`routes[].backends[].mcp.toolNameOverrides[].target`|string|Target this override applies to (same namespace as `mcp.targets[].name`).|
 |`routes[].backends[].mcp.toolNameOverrides[].source`|string|Tool name as served by the upstream.|
 |`routes[].backends[].mcp.toolNameOverrides[].name`|string|Client-facing tool name.|
+|`routes[].backends[].mcp.lazyTools`|boolean|Expose the aggregated tool catalog lazily: `tools/list` advertises only two<br>gateway tools, `mcp_search` (find tools by name or purpose) and `mcp_call`<br>(invoke a tool found via `mcp_search`). Direct calls to upstream tool names<br>keep working, so enabling this only changes discovery, never capability.|
 |`routes[].backends[].ai`|object||
 |`routes[].backends[].ai.name`|string|Name identifying this provider, referenced by `llm.models[].provider`.|
 |`routes[].backends[].ai.provider`|object|The upstream LLM provider type and its configuration.<br>Exactly one of openAI, gemini, vertex, anthropic, bedrock, azure, copilot, or custom may be set.|
@@ -6191,6 +6195,7 @@
 |`mcp.toolNameOverrides[].target`|string|Target this override applies to (same namespace as `mcp.targets[].name`).|
 |`mcp.toolNameOverrides[].source`|string|Tool name as served by the upstream.|
 |`mcp.toolNameOverrides[].name`|string|Client-facing tool name.|
+|`mcp.lazyTools`|boolean|Expose the aggregated tool catalog lazily: `tools/list` advertises only two<br>gateway tools, `mcp_search` (find tools by name or purpose) and `mcp_call`<br>(invoke a tool found via `mcp_search`). Direct calls to upstream tool names<br>keep working, so enabling this only changes discovery, never capability.|
 |`mcp.policies`|object|Policies applied to MCP requests.|
 |`mcp.policies.requestHeaderModifier`|object|Modify request headers before forwarding.|
 |`mcp.policies.requestHeaderModifier.add`|object|Headers to append without replacing existing values.|

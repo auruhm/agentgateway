@@ -612,7 +612,10 @@ impl Relay {
 		if kind == ResolveKind::Tool
 			&& let Some((target, source)) = self.upstreams.tool_name_overrides.source_of(res)
 		{
-			return Ok((Cow::Owned(target.to_string()), Cow::Owned(source.to_string())));
+			return Ok((
+				Cow::Owned(target.to_string()),
+				Cow::Owned(source.to_string()),
+			));
 		}
 		if self.needs_resolution() {
 			let target = self.resolve_unprefixed(kind, res, ctx, meta).await?;
@@ -992,9 +995,7 @@ impl Relay {
 				.flat_map(|(server_name, tools)| {
 					tools
 						.into_iter()
-						.filter(|t| {
-							!duplicates.contains(&public_name(server_name.as_str(), t.name.as_ref()))
-						})
+						.filter(|t| !duplicates.contains(&public_name(server_name.as_str(), t.name.as_ref())))
 						// Apply authorization policies, filtering tools that are not allowed.
 						// Policies are evaluated against the upstream (original) tool name.
 						.filter(|t| {
