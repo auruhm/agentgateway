@@ -2169,6 +2169,8 @@ pub(crate) fn backend_with_policies_from_proto(
 				// (`LocalMcpBackend`) supports these overrides today.
 				server: None,
 				tool_name_overrides: vec![],
+				// Not yet exposed over xDS; only `LocalMcpBackend` supports lazy tools today.
+				lazy_tools: false,
 			},
 		),
 		Some(backend::Kind::Guardrail(_)) => {

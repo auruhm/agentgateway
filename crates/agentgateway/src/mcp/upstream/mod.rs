@@ -476,6 +476,8 @@ pub(crate) struct UpstreamGroup {
 	/// Two-way index built from `mcp.tool_name_overrides`; empty when multiplexing is
 	/// configured for exact names (`prefixMode` other than `never`).
 	pub tool_name_overrides: Arc<ToolNameOverrides>,
+	/// When set, `tools/list` advertises only the gateway `mcp_search`/`mcp_call` tools.
+	pub lazy_tools: bool,
 }
 
 /// Two-way index built from `mcp.tool_name_overrides`: `(target, source) -> public` for
@@ -555,6 +557,7 @@ impl UpstreamGroup {
 			prefix_mode: backend.prefix_mode,
 			sse_keep_alive: backend.sse_keep_alive,
 			tool_name_overrides: Arc::new(ToolNameOverrides::build(&backend.tool_name_overrides)),
+			lazy_tools: backend.lazy_tools,
 			backend,
 			client,
 			by_name: IndexMap::new(),

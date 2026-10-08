@@ -2062,6 +2062,7 @@ async fn test_openapi_from_url() {
 		dns_rebinding_protection: false,
 		server: None,
 		tool_name_overrides: vec![],
+		lazy_tools: false,
 	});
 
 	// Convert to runtime backends

@@ -1850,6 +1850,7 @@ impl LocalBackend {
 					dns_rebinding_protection: tgt.dns_rebinding_protection,
 					server: tgt.server.clone(),
 					tool_name_overrides: tgt.tool_name_overrides.clone(),
+					lazy_tools: tgt.lazy_tools,
 				};
 				backends.push(Backend::MCP(name, m).into());
 				backends
@@ -1982,6 +1983,12 @@ pub struct LocalMcpBackend {
 	/// `prefix_mode: never`.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub tool_name_overrides: Vec<McpToolNameOverride>,
+	/// Expose the aggregated tool catalog lazily: `tools/list` advertises only two
+	/// gateway tools, `mcp_search` (find tools by name or purpose) and `mcp_call`
+	/// (invoke a tool found via `mcp_search`). Direct calls to upstream tool names
+	/// keep working, so enabling this only changes discovery, never capability.
+	#[serde(default, skip_serializing_if = "crate::serdes::is_default")]
+	pub lazy_tools: bool,
 }
 
 #[apply(schema_de!)]

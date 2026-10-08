@@ -1944,6 +1944,10 @@ pub struct McpBackend {
 	/// Only valid together with `prefixMode: never`.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub tool_name_overrides: Vec<McpToolNameOverride>,
+	/// Expose tools lazily: advertise only the gateway-generated `mcp_search` and
+	/// `mcp_call` tools instead of the full aggregated catalog.
+	#[serde(default, skip_serializing_if = "crate::serdes::is_default")]
+	pub lazy_tools: bool,
 }
 
 /// Declarative rename of a single tool served by one target.

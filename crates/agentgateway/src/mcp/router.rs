@@ -115,6 +115,7 @@ impl App {
 				sse_keep_alive: backend.sse_keep_alive,
 				server: backend.server.clone(),
 				tool_name_overrides: backend.tool_name_overrides.clone(),
+				lazy_tools: backend.lazy_tools,
 			}
 		};
 		let sessions = self.session.clone();
@@ -250,6 +251,7 @@ pub struct McpBackendGroup {
 	pub sse_keep_alive: Option<Duration>,
 	pub server: Option<McpServerOverrides>,
 	pub tool_name_overrides: Vec<crate::types::agent::McpToolNameOverride>,
+	pub lazy_tools: bool,
 }
 
 impl Default for McpBackendGroup {
@@ -263,6 +265,7 @@ impl Default for McpBackendGroup {
 			sse_keep_alive: None,
 			server: None,
 			tool_name_overrides: vec![],
+			lazy_tools: false,
 		}
 	}
 }
