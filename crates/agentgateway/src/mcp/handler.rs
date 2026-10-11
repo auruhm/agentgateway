@@ -228,6 +228,39 @@ fn finalize_catalog(
 		.collect_vec()
 }
 
+/// Split text into words on the same separators the query splitter uses.
+fn split_words(text: &str) -> Vec<&str> {
+	text
+		.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+		.filter(|w| !w.is_empty())
+		.collect()
+}
+
+fn is_cyrillic(c: char) -> bool {
+	matches!(c, '\u{0400}'..='\u{04FF}')
+}
+
+/// Inflection-tolerant match between a query token and one description word.
+///
+/// `mcp_search` otherwise matches literal substrings, so a Russian query in one
+/// grammatical form misses a description written in another («решения» vs
+/// «решение», «память» vs «памяти»). For Cyrillic tokens we additionally accept a
+/// word that agrees with the token up to its last two characters. Pure-ASCII
+/// tokens keep the exact-substring behaviour, so tool-name and English matching
+/// is unchanged.
+fn inflect_match(token: &str, word: &str) -> bool {
+	if !token.chars().any(is_cyrillic) {
+		return false;
+	}
+	let common = token
+		.chars()
+		.zip(word.chars())
+		.take_while(|pair| pair.0 == pair.1)
+		.count();
+	let shorter = token.chars().count().min(word.chars().count());
+	common >= 3 && common + 2 >= shorter
+}
+
 /// Rank catalog tools against a free-text query: name hits weigh more than description hits.
 fn search_catalog(catalog: Vec<Tool>, query: &str, limit: usize) -> Vec<Tool> {
 	let tokens: Vec<String> = query
@@ -244,12 +277,13 @@ fn search_catalog(catalog: Vec<Tool>, query: &str, limit: usize) -> Vec<Tool> {
 		.filter_map(|t| {
 			let name = t.name.to_lowercase();
 			let desc = t.description.as_deref().unwrap_or("").to_lowercase();
+			let desc_words = split_words(&desc);
 			let mut score = 0i64;
 			for tok in &tokens {
 				if name.contains(tok.as_str()) {
 					score += 10;
 				}
-				if desc.contains(tok.as_str()) {
+				if desc.contains(tok.as_str()) || desc_words.iter().any(|w| inflect_match(tok, w)) {
 					score += 2;
 				}
 			}
@@ -2573,6 +2607,41 @@ mod tests {
 		assert!(!names.contains(&"unrelated".to_string()));
 		// An empty query matches nothing rather than dumping the whole catalog.
 		assert!(search_catalog(vec![tool("x", "y")], "   ", 5).is_empty());
+	}
+
+	#[test]
+	fn search_catalog_matches_inflected_cyrillic() {
+		let tool = |name: &str, desc: &str| {
+			Tool::new_with_raw(
+				Cow::Owned(name.to_string()),
+				Some(Cow::Owned(desc.to_string())),
+				Arc::new(json!({ "type": "object" }).as_object().cloned().unwrap()),
+			)
+		};
+		// A fresh catalog per call keeps the assertions independent of `Tool: Clone`.
+		let names_for = |query: &str| -> Vec<String> {
+			let catalog = vec![
+				tool("memory_show", "Читает решение по проекту"),
+				tool("board_list", "Список задач на доске"),
+				tool("recall_mem", "Краткая память агента"),
+				tool("unrelated", "nothing to see here"),
+			];
+			search_catalog(catalog, query, 8)
+				.iter()
+				.map(|t| t.name.to_string())
+				.collect()
+		};
+
+		// Query forms that no description spells out verbatim still match.
+		assert!(names_for("решения").contains(&"memory_show".to_string()));
+		assert!(names_for("решению").contains(&"memory_show".to_string()));
+		assert!(names_for("доска").contains(&"board_list".to_string()));
+		assert!(names_for("памяти").contains(&"recall_mem".to_string()));
+
+		// Unrelated tools stay out; ASCII substring behaviour is unchanged.
+		assert!(!names_for("решения").contains(&"unrelated".to_string()));
+		assert!(!names_for("памяти").contains(&"board_list".to_string()));
+		assert!(names_for("unrelated").contains(&"unrelated".to_string()));
 	}
 
 	#[test]
