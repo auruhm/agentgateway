@@ -773,6 +773,8 @@ impl TestBind {
 				sse_keep_alive: None,
 				dns_rebinding_protection,
 				server: None,
+				tool_name_overrides: vec![],
+				lazy_tools: false,
 			},
 		);
 		{
@@ -918,6 +920,8 @@ impl TestBind {
 				sse_keep_alive: None,
 				dns_rebinding_protection: false,
 				server: None,
+				tool_name_overrides: vec![],
+				lazy_tools: false,
 			},
 		);
 		{
