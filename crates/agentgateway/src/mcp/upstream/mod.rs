@@ -1,4 +1,6 @@
 mod client;
+mod lazy;
+use lazy::LazyUpstream;
 mod openapi;
 mod sse;
 mod stdio;
@@ -52,6 +54,57 @@ impl IncomingRequestContext {
 			authority: parts.uri.authority().cloned(),
 		}
 	}
+	/// Долгоживущий контекст служебных HTTP-ответов, не snapshot пользовательского запроса.
+	pub(super) fn for_service_reply(&self) -> Self {
+		fn keep<T: Clone + Send + Sync + 'static>(
+			from: &::http::Extensions,
+			to: &mut ::http::Extensions,
+		) {
+			if let Some(value) = from.get::<T>() {
+				to.insert(value.clone());
+			}
+		}
+		let mut request = ::http::Request::new(None);
+		*request.method_mut() = ::http::Method::POST;
+		// Auth может читать произвольный header/cookie: оставляем handshake credentials,
+		// но не framing, MCP routing/arguments и request tracing.
+		for (name, value) in self.request.headers() {
+			if matches!(
+				name.as_str(),
+				"content-length"
+					| "content-encoding"
+					| "content-type"
+					| "transfer-encoding"
+					| "mcp-session-id"
+					| "mcp-method"
+					| "mcp-name"
+					| "traceparent"
+					| "tracestate"
+					| "baggage"
+			) || name.as_str().starts_with("mcp-param-")
+			{
+				continue;
+			}
+			request.headers_mut().append(name.clone(), value.clone());
+		}
+		let from = self.extensions();
+		let to = request.extensions_mut();
+		keep::<crate::http::jwt::Claims>(from, to);
+		keep::<crate::http::apikey::Claims>(from, to);
+		keep::<crate::http::basicauth::Claims>(from, to);
+		keep::<crate::http::ext_authz::ExtAuthzDynamicMetadata>(from, to);
+		keep::<crate::cel::SourceContext>(from, to);
+		keep::<crate::http::substrate::ActorIdentity>(from, to);
+		keep::<crate::http::substrate::EgressRequestProtocol>(from, to);
+		keep::<crate::http::substrate::EgressTlsMode>(from, to);
+		keep::<crate::http::filters::AutoHostname>(from, to);
+		keep::<crate::http::filters::BackendRequestTimeout>(from, to);
+		Self {
+			request,
+			authority: self.authority.clone(),
+		}
+	}
+
 	pub fn headers_mut(&mut self) -> &mut http::HeaderMap {
 		self.request.headers_mut()
 	}
@@ -196,6 +249,8 @@ pub enum UpstreamError {
 	Stdio(#[from] io::Error),
 	#[error("stdio server exited")]
 	StdioShutdown,
+	#[error("upstream handshake error: {}", .0.message)]
+	Handshake(rmcp::ErrorData),
 	#[error("upstream closed on send")]
 	Send,
 	#[error("upstream closed on receive")]
@@ -205,6 +260,7 @@ pub enum UpstreamError {
 // UpstreamTarget defines a source for MCP information.
 #[derive(Debug)]
 pub(crate) enum Upstream {
+	Lazy(Arc<LazyUpstream>),
 	McpStreamable(streamablehttp::Client),
 	McpSSE(sse::Client),
 	McpStdio(stdio::Process),
@@ -212,8 +268,33 @@ pub(crate) enum Upstream {
 }
 
 impl Upstream {
+	fn event_stream_boxed<'a>(
+		&'a self,
+		target: &'a str,
+		ctx: &'a IncomingRequestContext,
+	) -> std::pin::Pin<
+		Box<dyn std::future::Future<Output = Result<Messages, UpstreamError>> + Send + 'a>,
+	> {
+		Box::pin(self.get_event_stream(target, ctx))
+	}
+
+	fn generic_stream_boxed<'a>(
+		&'a self,
+		target: &'a str,
+		request: JsonRpcRequest<ClientRequest>,
+		ctx: &'a IncomingRequestContext,
+	) -> std::pin::Pin<
+		Box<dyn std::future::Future<Output = Result<Messages, UpstreamError>> + Send + 'a>,
+	> {
+		Box::pin(self.generic_stream(target, request, ctx))
+	}
+
 	pub fn get_session_state(&self) -> Option<http::sessionpersistence::MCPSession> {
 		match self {
+			Upstream::Lazy(c) => c
+				.transport
+				.get()
+				.and_then(|transport| transport.get_session_state()),
 			Upstream::McpStreamable(c) => Some(c.get_session_state()),
 			Upstream::McpSSE(c) => Some(c.get_session_state()),
 			Upstream::OpenAPI(c) => Some(c.get_session_state()),
@@ -223,6 +304,11 @@ impl Upstream {
 
 	pub fn set_session_id(&self, id: Option<&str>, pinned: Option<SocketAddr>) {
 		match self {
+			Upstream::Lazy(c) => {
+				if let Some(t) = c.transport.get() {
+					t.set_session_id(id, pinned);
+				}
+			},
 			Upstream::McpStreamable(c) => c.set_session_id(id, pinned),
 			Upstream::McpSSE(c) => c.set_session_id(id, pinned),
 			Upstream::McpStdio(_) => {},
@@ -235,6 +321,18 @@ impl Upstream {
 		target_name: &str,
 		ctx: &IncomingRequestContext,
 	) -> Result<(), UpstreamError> {
+		if let Self::Lazy(c) = self {
+			return match c.transport.get() {
+				Some(t) => {
+					let backend_ctx = match c.version() {
+						Some(version) => lazy::backend_context(ctx, version)?,
+						None => ctx.clone(),
+					};
+					Box::pin(t.delete(target_name, &backend_ctx)).await
+				},
+				None => Ok(()),
+			};
+		}
 		if matches!(self, Upstream::OpenAPI(_))
 			|| matches!(self, Upstream::McpStreamable(c) if !c.has_session_id())
 		{
@@ -245,6 +343,7 @@ impl Upstream {
 			ctx.start_mcp_outbound_span(format!("DELETE {target_name}"), target_name, None, None);
 		let result: Result<(), UpstreamError> = async {
 			match &self {
+				Upstream::Lazy(_) => unreachable!(),
 				Upstream::McpStdio(c) => {
 					c.stop().await?;
 				},
@@ -273,6 +372,22 @@ impl Upstream {
 		target_name: &str,
 		ctx: &IncomingRequestContext,
 	) -> Result<mergestream::Messages, UpstreamError> {
+		if let Self::Lazy(c) = self {
+			let c = c.clone();
+			let ctx = ctx.clone();
+			let target = target_name.to_owned();
+			return Ok(Messages::deferred(async move {
+				c.connected
+					.subscribe()
+					.wait_for(|ready| *ready)
+					.await
+					.map_err(|_| UpstreamError::Recv)?;
+				let transport = c.transport.get().ok_or(UpstreamError::Recv)?;
+				let version = c.version().ok_or(UpstreamError::Recv)?;
+				let backend_ctx = lazy::backend_context(&ctx, version)?;
+				transport.event_stream_boxed(&target, &backend_ctx).await
+			}));
+		}
 		if matches!(self, Upstream::McpStdio(_) | Upstream::OpenAPI(_)) {
 			return match self {
 				Upstream::McpStdio(c) => Ok(c.get_event_stream().await?),
@@ -285,6 +400,7 @@ impl Upstream {
 			ctx.start_mcp_outbound_span(format!("GET {target_name}"), target_name, None, None);
 		let result: Result<Messages, UpstreamError> = async {
 			match &self {
+				Upstream::Lazy(_) => unreachable!(),
 				Upstream::McpStdio(c) => Ok(c.get_event_stream().await?),
 				Upstream::McpSSE(c) => c.connect_to_event_stream(&ctx).await,
 				Upstream::McpStreamable(c) => c
@@ -307,6 +423,19 @@ impl Upstream {
 		mut request: JsonRpcRequest<ClientRequest>,
 		ctx: &IncomingRequestContext,
 	) -> Result<mergestream::Messages, UpstreamError> {
+		if let Self::Lazy(c) = self {
+			let (transport, version) = Box::pin(c.ready(ctx)).await?;
+			let backend_ctx = lazy::adapt_request(&mut request, ctx, version)?;
+			let stream = transport
+				.generic_stream_boxed(target_name, request, &backend_ctx)
+				.await?;
+			return Ok(lazy::service_pings(
+				stream,
+				transport.clone(),
+				target_name.to_string(),
+				backend_ctx,
+			));
+		}
 		let method = request.request.method().to_string();
 		let (operation_target, tool_name) = match &request.request {
 			ClientRequest::CallToolRequest(request) => {
@@ -346,6 +475,7 @@ impl Upstream {
 			}
 			ctx.stamp_trace_context(&mut request.request.get_meta_mut().0);
 			match &self {
+				Upstream::Lazy(_) => unreachable!(),
 				Upstream::McpStdio(c) => Ok(mergestream::Messages::from(
 					Box::pin(c.send_message(request, &ctx).assert_size::<{ 6 * 1024 }>()).await?,
 				)),
@@ -383,6 +513,19 @@ impl Upstream {
 		mut request: ClientNotification,
 		ctx: &IncomingRequestContext,
 	) -> Result<(), UpstreamError> {
+		if let Self::Lazy(c) = self {
+			if matches!(request, ClientNotification::InitializedNotification(_)) {
+				return Ok(());
+			}
+			return match c.transport.get() {
+				Some(t) if c.version().is_some() => {
+					let version = c.version().ok_or(UpstreamError::Recv)?;
+					let backend_ctx = lazy::backend_context(ctx, version)?;
+					Box::pin(t.generic_notification(target_name, request, &backend_ctx)).await
+				},
+				_ => Ok(()),
+			};
+		}
 		if matches!(self, Upstream::OpenAPI(_)) {
 			return Ok(());
 		}
@@ -404,6 +547,7 @@ impl Upstream {
 		ctx.stamp_trace_context(&mut request.get_meta_mut().0);
 		let result: Result<(), UpstreamError> = async {
 			match &self {
+				Upstream::Lazy(_) => unreachable!(),
 				Upstream::McpStdio(c) => c.send_notification(request, &ctx).await?,
 				Upstream::McpSSE(c) => c.send_notification(request, &ctx).await?,
 				Upstream::McpStreamable(c) => {
@@ -426,6 +570,20 @@ impl Upstream {
 		message: ClientJsonRpcMessage,
 		ctx: &IncomingRequestContext,
 	) -> Result<(), UpstreamError> {
+		if let Self::Lazy(c) = self {
+			return match c.transport.get() {
+				Some(t) => {
+					let backend_ctx = match c.version() {
+						Some(version) => lazy::backend_context(ctx, version)?,
+						None => ctx.clone(),
+					};
+					Box::pin(t.generic_client_message(target_name, message, &backend_ctx)).await
+				},
+				None => Err(UpstreamError::InvalidRequest(
+					"upstream is not connected".into(),
+				)),
+			};
+		}
 		if matches!(self, Upstream::OpenAPI(_)) {
 			return Err(UpstreamError::InvalidRequest(
 				"openapi upstream does not support server-to-client routing".into(),
@@ -436,6 +594,7 @@ impl Upstream {
 			ctx.start_mcp_outbound_span(format!("response {target_name}"), target_name, None, None);
 		let result: Result<(), UpstreamError> = async {
 			match &self {
+				Upstream::Lazy(_) => unreachable!(),
 				Upstream::McpStdio(c) => c.send_client_message(message, &ctx).await,
 				Upstream::McpSSE(c) => c.send_client_message(message, &ctx).await,
 				Upstream::McpStreamable(c) => {
@@ -585,7 +744,16 @@ impl UpstreamGroup {
 	pub(crate) fn setup_connections(&mut self) -> Result<(), mcp::Error> {
 		for tgt in &self.backend.targets {
 			debug!("initializing target: {}", tgt.name);
-			match self.setup_upstream(tgt.as_ref()) {
+			let transport = if self.lazy_tools {
+				Ok(Upstream::Lazy(Arc::new(LazyUpstream::new(
+					self.client.clone(),
+					tgt.clone(),
+					self.backend.stateful,
+				))))
+			} else {
+				Self::setup_upstream(&self.client, self.backend.stateful, tgt.as_ref())
+			};
+			match transport {
 				Ok(transport) => {
 					self.by_name.insert(tgt.name.clone(), Arc::new(transport));
 				},
@@ -620,6 +788,14 @@ impl UpstreamGroup {
 		self.by_name.get_key_value(name).map(|(k, _)| k.as_str())
 	}
 
+	pub(crate) fn defer_initialize(&self, initialize: rmcp::model::InitializeRequest) {
+		for upstream in self.by_name.values() {
+			if let Upstream::Lazy(lazy) = upstream.as_ref() {
+				lazy.defer_initialize(initialize.clone());
+			}
+		}
+	}
+
 	pub(crate) fn stateful(&self) -> bool {
 		self.backend.stateful
 	}
@@ -631,10 +807,12 @@ impl UpstreamGroup {
 	/// True when some target's `delete` does teardown work even without an upstream
 	/// session id: stdio processes and SSE streams hold per-connection state.
 	pub(crate) fn has_connection_teardown(&self) -> bool {
-		self
-			.by_name
-			.values()
-			.any(|u| matches!(u.as_ref(), Upstream::McpStdio(_) | Upstream::McpSSE(_)))
+		self.by_name.values().any(|u| {
+			matches!(
+				u.as_ref(),
+				Upstream::Lazy(_) | Upstream::McpStdio(_) | Upstream::McpSSE(_)
+			)
+		})
 	}
 
 	pub(crate) fn record_extensions(&self, target: &str, extensions: Option<&ExtensionCapabilities>) {
@@ -663,7 +841,11 @@ impl UpstreamGroup {
 		}))
 	}
 
-	fn setup_upstream(&self, target: &McpTarget) -> Result<upstream::Upstream, mcp::Error> {
+	fn setup_upstream(
+		policy_client: &PolicyClient,
+		stateful: bool,
+		target: &McpTarget,
+	) -> Result<upstream::Upstream, mcp::Error> {
 		trace!("connecting to target: {}", target.name);
 		let target = match &target.spec {
 			McpTargetSpec::Sse(sse) => {
@@ -674,13 +856,13 @@ impl UpstreamGroup {
 				};
 
 				let upstream_client = McpHttpClient::new(
-					self.client.clone(),
+					policy_client.clone(),
 					target
 						.backend
 						.clone()
 						.expect("there must be a backend for SSE"),
 					target.backend_policies.clone(),
-					self.backend.stateful,
+					stateful,
 					target.name.to_string(),
 				);
 				let client = sse::Client::new(upstream_client, path.into());
@@ -698,13 +880,13 @@ impl UpstreamGroup {
 				};
 
 				let http_client = McpHttpClient::new(
-					self.client.clone(),
+					policy_client.clone(),
 					target
 						.backend
 						.clone()
 						.expect("there must be a backend for MCP"),
 					target.backend_policies.clone(),
-					self.backend.stateful,
+					stateful,
 					target.name.to_string(),
 				);
 				let client = streamablehttp::Client::new(http_client, path.into())
@@ -747,13 +929,13 @@ impl UpstreamGroup {
 				let prefix = openapi::get_server_prefix(&open.schema).map_err(mcp::Error::OpenAPI)?;
 
 				let http_client = McpHttpClient::new(
-					self.client.clone(),
+					policy_client.clone(),
 					target
 						.backend
 						.clone()
 						.expect("there must be a backend for OpenAPI"),
 					target.backend_policies.clone(),
-					self.backend.stateful,
+					stateful,
 					target.name.to_string(),
 				);
 				upstream::Upstream::OpenAPI(Box::new(openapi::Handler::new(

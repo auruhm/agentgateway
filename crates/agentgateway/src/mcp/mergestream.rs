@@ -23,6 +23,27 @@ impl Messages {
 		Messages(futures::stream::empty().boxed())
 	}
 
+	pub(crate) fn from_stream(
+		stream: impl Stream<Item = Result<ServerJsonRpcMessage, ClientError>> + Send + 'static,
+	) -> Self {
+		Messages(stream.boxed())
+	}
+
+	pub(crate) fn deferred(
+		future: impl Future<Output = Result<Messages, super::upstream::UpstreamError>> + Send + 'static,
+	) -> Self {
+		Messages(
+			futures::stream::once(async move {
+				match future.await {
+					Ok(stream) => stream,
+					Err(error) => Messages::from(Err(ClientError::new(anyhow!(error.to_string())))),
+				}
+			})
+			.flatten()
+			.boxed(),
+		)
+	}
+
 	pub fn then_pending(self) -> Self {
 		Messages(self.0.chain(futures::stream::pending()).boxed())
 	}

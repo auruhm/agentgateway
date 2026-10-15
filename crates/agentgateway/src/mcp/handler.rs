@@ -36,6 +36,9 @@ use crate::types::agent::{McpPrefixMode, McpServerOverrides, ResourceName};
 
 const DELIMITER: &str = "_";
 
+#[derive(Clone)]
+struct LocalBootstrap;
+
 // Pagination state is carried by the client using the same base64/AES encoder as sessions.
 // Encode a list of per-target cursors; absent targets are finished.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1068,6 +1071,17 @@ impl Relay {
 		self.upstreams.lazy_tools
 	}
 
+	pub async fn send_lazy_list(
+		&self,
+		mut r: JsonRpcRequest<ClientRequest>,
+		ctx: IncomingRequestContext,
+	) -> Result<Response, UpstreamError> {
+		if let ClientRequest::ListToolsRequest(list) = &mut r.request {
+			list.extensions.insert(LocalBootstrap);
+		}
+		self.send_fanout(r, ctx, self.merge_tools_lazy()).await
+	}
+
 	/// `tools/list` merge for a lazy backend: advertise only the two gateway tools.
 	pub fn merge_tools_lazy(&self) -> Box<MergeFn> {
 		Box::new(move |_streams, _cel| {
@@ -1128,6 +1142,22 @@ impl Relay {
 		let resource_subscribe = self.upstreams.stateful();
 		let upstreams = self.upstreams.clone();
 		Box::new(move |s, _cel| {
+			if upstreams.lazy_tools {
+				let version = if ProtocolVersion::KNOWN_VERSIONS.contains(&pv) {
+					pv
+				} else {
+					ProtocolVersion::default()
+				};
+				let mut info = Self::get_info(
+					version,
+					false,
+					Vec::new(),
+					None,
+					upstreams.server_overrides(),
+				);
+				info.capabilities = ServerCapabilities::builder().enable_tools().build();
+				return Ok(info.into());
+			}
 			if !multiplexing {
 				// Happy case: we can forward everything
 				let Some((name, result)) = s.into_iter().next() else {
@@ -1177,6 +1207,12 @@ impl Relay {
 		let resource_subscribe = self.upstreams.stateful();
 		let upstreams = self.upstreams.clone();
 		Box::new(move |s, _cel| {
+			if upstreams.lazy_tools {
+				let mut discover =
+					Self::get_discovery(false, Vec::new(), None, upstreams.server_overrides());
+				discover.capabilities = ServerCapabilities::builder().enable_tools().build();
+				return Ok(discover.into());
+			}
 			// Single server: forward the upstream's advertised versions untouched. The gateway
 			// does no version translation, so an old-only upstream must surface as-is and let
 			// the client fall back to `initialize`. Multiplexed: advertise the intersection.
@@ -1445,6 +1481,17 @@ impl Relay {
 			}
 		}
 
+		// Локальный bootstrap проходит те же request/response guardrails, но не открывает transport.
+		if self.lazy_tools()
+			&& (matches!(
+				&r.request,
+				ClientRequest::InitializeRequest(_)
+					| ClientRequest::DiscoverRequest(_)
+					| ClientRequest::PingRequest(_)
+			) || matches!(&r.request, ClientRequest::ListToolsRequest(list) if list.extensions.get::<LocalBootstrap>().is_some()))
+		{
+			return Ok((Vec::new(), service_names));
+		}
 		let futs: Vec<_> = selected_upstreams
 			.into_iter()
 			.map(|(name, con)| {

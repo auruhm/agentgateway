@@ -30,6 +30,217 @@ use crate::types::agent::{
 use crate::*;
 
 #[tokio::test]
+async fn lazy_bootstrap_does_not_contact_slow_backend() {
+	use std::time::Duration;
+	use wiremock::matchers::method;
+	use wiremock::{Mock, ResponseTemplate};
+	for stateful in [false, true] {
+		let backend = wiremock::MockServer::start().await;
+		Mock::given(method("POST"))
+			.respond_with(ResponseTemplate::new(503).set_delay(Duration::from_secs(5)))
+			.mount(&backend)
+			.await;
+		let ctx = super::upstream::IncomingRequestContext::empty();
+		let relay = Relay::new_for_request(
+			McpBackendGroup {
+				targets: vec![
+					fake_streamable_target("slow", *backend.address()),
+					fake_sse_target("slow-sse", *backend.address()),
+					Arc::new(McpTarget {
+						name: "deferred-stdio".into(),
+						condition: None,
+						spec: crate::types::agent::McpTargetSpec::Stdio {
+							cmd: "/nonexistent-lazy-regression-backend".into(),
+							args: vec![],
+							env: Default::default(),
+							clear_env: true,
+						},
+						backend: None,
+						backend_policies: Default::default(),
+					}),
+				],
+				stateful,
+				lazy_tools: true,
+				..Default::default()
+			},
+			empty_mcp_policies(),
+			PolicyClient::new(setup_proxy_test("{}").unwrap().pi),
+			&ctx,
+		)
+		.unwrap();
+		let manager = super::session::SessionManager::new(http::sessionpersistence::Encoder::base64());
+		let mut session = manager.create_stateless_session(relay);
+		for body in [
+			mcp_initialize_body(),
+			serde_json::json!({
+				"jsonrpc": "2.0", "id": 2, "method": "tools/list"
+			}),
+			serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+		] {
+			let message = serde_json::from_value(body).unwrap();
+			let response = tokio::time::timeout(
+				Duration::from_millis(500),
+				session.stateless_send_and_initialize(ctx.clone(), message, !stateful),
+			)
+			.await
+			.expect("lazy bootstrap waited for backend")
+			.unwrap();
+			assert_eq!(response.status(), http::StatusCode::OK);
+			let body = http_body_util::BodyExt::collect(response.into_body())
+				.await
+				.unwrap()
+				.to_bytes();
+			assert!(!body.is_empty());
+			assert_eq!(
+				backend.received_requests().await.unwrap().len(),
+				0,
+				"lazy bootstrap made backend requests"
+			);
+		}
+	}
+}
+
+// Строгий backend: фиксируем порядок handshake и точное число вызовов (без replay).
+#[tokio::test]
+async fn lazy_discovery_initializes_once_and_calls_without_replay() {
+	use wiremock::matchers::method;
+	use wiremock::{Mock, ResponseTemplate};
+	for stateful in [false, true] {
+		for (version, backend_version) in [
+			("2024-11-05", "2024-11-05"),
+			("2025-03-26", "2025-03-26"),
+			("2025-06-18", "2025-06-18"),
+			("2025-11-25", "2025-11-25"),
+			("2026-07-28", "2026-07-28"),
+			("2025-06-18", "2025-03-26"),
+			("2026-07-28", "2025-03-26"),
+		] {
+			let modern = version == "2026-07-28";
+
+			let backend = wiremock::MockServer::start().await;
+			Mock::given(method("POST")).respond_with(move |request: &wiremock::Request| {
+				let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+				let name = body["method"].as_str().unwrap();
+				if name == "notifications/initialized" { return ResponseTemplate::new(202); }
+				if name == "server/discover" && backend_version != "2026-07-28" {
+					return ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc": "2.0", "id": body["id"], "error": {"code": -32601, "message": "legacy only"}}));
+				}
+				if name == "tools/list" || name == "tools/call" {
+					assert_eq!(request.headers.get("mcp-protocol-version").unwrap().to_str().unwrap(), backend_version);
+					if backend_version == "2026-07-28" {
+						assert_eq!(body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], backend_version);
+					} else {
+						assert!(body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"].is_null());
+					}
+				}
+				let result = match name {
+					"server/discover" => serde_json::json!({"resultType": "complete", "supportedVersions": [backend_version], "capabilities": {"tools": {}}, "serverInfo": {"name": "strict", "version": "1"}, "ttlMs": 0, "cacheScope": "private"}),
+					"initialize" => serde_json::json!({"protocolVersion": backend_version, "capabilities": {"tools": {}}, "serverInfo": {"name": "strict", "version": "1"}}),
+					"tools/list" => serde_json::json!({"tools": [{"name": "echo", "description": "Echo input", "inputSchema": {"type": "object"}}]}),
+					"tools/call" => serde_json::json!({"content": [{"type": "text", "text": "called once"}]}),
+					_ => panic!("unexpected upstream method {name}"),
+				};
+				ResponseTemplate::new(200).set_body_json(serde_json::json!({"jsonrpc": "2.0", "id": body["id"], "result": result}))
+			}).mount(&backend).await;
+			let parts = ::http::Request::builder()
+				.header("mcp-protocol-version", version)
+				.body(())
+				.unwrap()
+				.into_parts()
+				.0;
+			let ctx = super::upstream::IncomingRequestContext::new(&parts);
+			let relay = Relay::new_for_request(
+				McpBackendGroup {
+					targets: vec![fake_streamable_target("strict", *backend.address())],
+					stateful,
+					lazy_tools: true,
+					..Default::default()
+				},
+				empty_mcp_policies(),
+				PolicyClient::new(setup_proxy_test("{}").unwrap().pi),
+				&ctx,
+			)
+			.unwrap();
+			let manager =
+				super::session::SessionManager::new(http::sessionpersistence::Encoder::base64());
+			let mut session = manager.create_stateless_session(relay);
+			if !modern {
+				let mut init = mcp_initialize_body();
+				init["params"]["protocolVersion"] = version.into();
+				let response = session
+					.send(ctx.clone(), serde_json::from_value(init).unwrap())
+					.await
+					.unwrap();
+				let _ = http_body_util::BodyExt::collect(response.into_body())
+					.await
+					.unwrap();
+			}
+			for (id, tool, args) in [
+				(2, "mcp_search", serde_json::json!({"query": "echo"})),
+				(
+					3,
+					"mcp_call",
+					serde_json::json!({"name": "echo", "arguments": {}}),
+				),
+			] {
+				let mut body = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": tool, "arguments": args}});
+				if modern {
+					body["params"]["_meta"] = modern_meta();
+				}
+				let response = session
+					.stateless_send_and_initialize(
+						ctx.clone(),
+						serde_json::from_value(body).unwrap(),
+						!stateful && !modern,
+					)
+					.await
+					.unwrap();
+				assert_eq!(response.status(), http::StatusCode::OK);
+				let bytes = http_body_util::BodyExt::collect(response.into_body())
+					.await
+					.unwrap()
+					.to_bytes();
+				let text = String::from_utf8(bytes.to_vec()).unwrap();
+				assert!(!text.contains("\"error\":"), "{version}: {text}");
+				assert!(
+					text.contains(if id == 2 { "echo" } else { "called once" }),
+					"{text}"
+				);
+			}
+			let requests = backend.received_requests().await.unwrap();
+			let methods: Vec<String> = requests
+				.iter()
+				.map(|r| {
+					serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["method"]
+						.as_str()
+						.unwrap()
+						.to_owned()
+				})
+				.collect();
+			let expected = if modern && backend_version == "2026-07-28" {
+				vec!["server/discover", "tools/list", "tools/call"]
+			} else if modern {
+				vec![
+					"server/discover",
+					"initialize",
+					"notifications/initialized",
+					"tools/list",
+					"tools/call",
+				]
+			} else {
+				vec![
+					"initialize",
+					"notifications/initialized",
+					"tools/list",
+					"tools/call",
+				]
+			};
+			assert_eq!(methods, expected, "{version}, stateful={stateful}");
+		}
+	}
+}
+
+#[tokio::test]
 async fn token_exchange_rejections_preserve_http_status() {
 	use wiremock::matchers::{method, path};
 	use wiremock::{Mock, ResponseTemplate};

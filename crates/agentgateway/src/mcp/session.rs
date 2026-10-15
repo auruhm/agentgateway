@@ -106,6 +106,16 @@ impl Session {
 				ClientJsonRpcMessage::Request(r) => Some(&r.request),
 				_ => None,
 			};
+			if self.relay.lazy_tools() {
+				// Сохраняем handshake локально; transport выполнит его только перед реальным запросом.
+				self
+					.send(
+						ctx.clone(),
+						ClientJsonRpcMessage::request(init_request.into(), RequestId::Number(0)),
+					)
+					.await?;
+				return self.send(ctx, message).await;
+			}
 			match request_type {
 				// Initialize only the target named by a prefixed call. With prefixMode: never,
 				// the list request used to find that target requires every target to be initialized.
@@ -507,6 +517,12 @@ impl Session {
 					ClientRequest::InitializeRequest(ir) => {
 						self.strip_unsupported_client_capabilities(&mut ir.params.capabilities, &ctx);
 
+						if self.relay.lazy_tools() {
+							if !ProtocolVersion::KNOWN_VERSIONS.contains(&ir.params.protocol_version) {
+								ir.params.protocol_version = ProtocolVersion::default();
+							}
+							self.relay.upstreams.defer_initialize(ir.clone());
+						}
 						let pv = ir.params.protocol_version.clone();
 						let res = Box::pin(
 							self.relay.send_fanout(
@@ -538,12 +554,7 @@ impl Session {
 					},
 					ClientRequest::ListToolsRequest(_) => {
 						if self.relay.lazy_tools() {
-							Box::pin(
-								self
-									.relay
-									.send_fanout(r, ctx, self.relay.merge_tools_lazy()),
-							)
-							.await
+							Box::pin(self.relay.send_lazy_list(r, ctx)).await
 						} else {
 							Box::pin(
 								self
