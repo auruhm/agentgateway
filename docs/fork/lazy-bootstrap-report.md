@@ -1,6 +1,15 @@
 # Локальный bootstrap lazyTools — проверка candidate
 
-> **Финальные исходники и debug-кандидат проверены Main. Production НЕ переключён.** После исправления stack-boundary полная lib suite: **2314 passed, 0 failed, 1 existing ignored**. Бинарные интеграции: **8/8 bootstrap + 12/12 negotiation PASS**, включая default-stack stateless regression, ping-before-init, версии/транспорты/auth и отсутствие replay.
+> **Статус на 15.10.2026: исправление развёрнуто в проде.** Из `feat/all` (`388f55a8`) собрана
+> release-сборка и установлена в `mcp_platform/.tools/agentgateway/agentgateway-darwin-arm64-patched`
+> (rollback — в `…/backups/2026-10-15-lazy-bootstrap/`), оба процесса перезапущены.
+> Общая карта форка — [`README.md`](README.md). Раздел «Что нужно для prod» ниже отражает
+> состояние **на момент проверки debug-кандидата**, а не текущее.
+>
+> **На момент проверки** (debug-кандидат, Production ещё не переключён): после исправления
+> stack-boundary полная lib suite: **2314 passed, 0 failed, 1 existing ignored**. Бинарные
+> интеграции: **8/8 bootstrap + 12/12 negotiation PASS**, включая default-stack stateless regression,
+> ping-before-init, версии/транспорты/auth и отсутствие replay.
 
 ## Финальная проверка Main
 
