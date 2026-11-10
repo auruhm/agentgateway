@@ -2,16 +2,15 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use agent_core::durfmt;
 use prost_types::Timestamp;
-use quick_cache::sync::Cache;
 use serde_json::Value as JsonValue;
 
 use crate::cel::{Expression, Value};
+use crate::http::expiring_cache::{ExpiringCache, Lookup};
 use crate::http::ext_authz::proto::attribute_context::HttpRequest;
 use crate::http::ext_authz::proto::authorization_client::AuthorizationClient;
 use crate::http::ext_authz::proto::check_response::HttpResponse;
@@ -70,7 +69,7 @@ pub struct ExtAuthzDynamicMetadata(serde_json::Map<String, JsonValue>);
 #[apply(schema!)]
 pub struct BodyOptions {
 	/// Maximum request body size to send to the authorization service. Defaults to 8192 bytes.
-	#[serde(default)]
+	#[serde(default = "default_max_request_bytes")]
 	pub max_request_bytes: u32,
 	/// Whether to send a partial body when the request exceeds `maxRequestBytes`.
 	#[serde(default)]
@@ -83,7 +82,7 @@ pub struct BodyOptions {
 impl Default for BodyOptions {
 	fn default() -> Self {
 		Self {
-			max_request_bytes: 8192,
+			max_request_bytes: default_max_request_bytes(),
 			allow_partial_message: false,
 			pack_as_bytes: false,
 		}
@@ -209,7 +208,7 @@ pub struct ExtAuthz {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub cache: Option<CacheConfig>,
 	#[serde(skip, default = "default_cache_store")]
-	pub(crate) cache_store: Arc<Cache<CacheKey, CachedExtAuthzResponse>>,
+	pub(crate) cache_store: ExpiringCache<CacheKey, CachedPolicyResponse>,
 }
 
 impl ExtAuthz {
@@ -217,7 +216,7 @@ impl ExtAuthz {
 		self.cache_store = self
 			.cache
 			.as_ref()
-			.map(|cache| cache_store(effective_cache_entries(cache.max_entries)))
+			.map(|cache| ExpiringCache::new(effective_cache_entries(cache.max_entries)))
 			.unwrap_or_else(default_cache_store);
 		self
 	}
@@ -260,34 +259,23 @@ impl ExtAuthz {
 		&self,
 		req: &Request,
 	) -> (Option<CacheKey>, CacheLookup, Option<CachedPolicyResponse>) {
-		match self.cache_key(req) {
-			Ok(cache_key) => match self.cache_store.get(&cache_key) {
-				Some(cached) => {
-					let now = Instant::now();
-					let lookup = cached.lookup(now);
-					match lookup {
-						CacheLookup::Hit => (Some(cache_key), CacheLookup::Hit, Some(cached.response)),
-						CacheLookup::Refresh => (Some(cache_key), CacheLookup::Refresh, None),
-						CacheLookup::Miss(CacheMissReason::ExpiredEntry) => {
-							self
-								.cache_store
-								.remove_if(&cache_key, |cached| cached.is_expired(now));
-							(
-								Some(cache_key),
-								CacheLookup::Miss(CacheMissReason::ExpiredEntry),
-								None,
-							)
-						},
-						CacheLookup::Miss(reason) => (Some(cache_key), CacheLookup::Miss(reason), None),
-					}
-				},
-				None => (
-					Some(cache_key),
-					CacheLookup::Miss(CacheMissReason::NoEntry),
-					None,
-				),
-			},
-			Err(reason) => (None, CacheLookup::Miss(reason), None),
+		let cache_key = match self.cache_key(req) {
+			Ok(cache_key) => cache_key,
+			Err(reason) => return (None, CacheLookup::Miss(reason), None),
+		};
+		match self.cache_store.lookup(&cache_key) {
+			Lookup::Hit(response) => (Some(cache_key), CacheLookup::Hit, Some(response)),
+			Lookup::Refresh => (Some(cache_key), CacheLookup::Refresh, None),
+			Lookup::Expired => (
+				Some(cache_key),
+				CacheLookup::Miss(CacheMissReason::ExpiredEntry),
+				None,
+			),
+			Lookup::Vacant => (
+				Some(cache_key),
+				CacheLookup::Miss(CacheMissReason::NoEntry),
+				None,
+			),
 		}
 	}
 
@@ -324,7 +312,7 @@ impl ExtAuthz {
 	}
 
 	/// Handle authorization failure with FailureMode configuration
-	fn handle_auth_failure(&self, error_msg: &str) -> Result<PolicyResponse, ProxyError> {
+	fn handle_auth_failure(&self) -> Result<PolicyResponse, ProxyError> {
 		match &self.failure_mode {
 			FailureMode::Allow => {
 				dtrace::pol_event!(
@@ -338,7 +326,11 @@ impl ExtAuthz {
 				let status = StatusCode::from_u16(*status_code).unwrap_or(StatusCode::FORBIDDEN);
 				let resp = ::http::Response::builder()
 					.status(status)
-					.body(http::Body::from(error_msg.to_string()))
+					.body(http::Body::from(
+						ProxyError::ExternalAuthorizationFailed(None)
+							.external_message()
+							.into_owned(),
+					))
 					.map_err(|e| ProxyError::Processing(e.into()))?;
 				Ok(PolicyResponse {
 					direct_response: Some(resp),
@@ -584,12 +576,13 @@ impl ExtAuthz {
 			span.record_grpc_result(&resp);
 		}
 
-		trace!("check response: {:?}", resp);
+		// Avoid logging header values, which may contain credentials added by the auth server.
+		trace!(status = ?resp.as_ref().map(|r| r.get_ref().status.as_ref().map(|s| s.code)).map_err(|e| e.code()), "check response");
 		let cr = match resp {
 			Ok(response) => response,
 			Err(e) => {
 				warn!("ext_authz request failed: {}", e);
-				return self.handle_auth_failure("Authorization service unavailable");
+				return self.handle_auth_failure();
 			},
 		};
 		let cr = cr.into_inner();
@@ -703,27 +696,12 @@ impl ExtAuthz {
 			);
 			return;
 		};
-		let Some(expires_at) = Instant::now().checked_add(ttl) else {
-			pol_event!(
-				Severity::Warn,
-				"skip inserting {key:?} into cache; invalid TTL overflow"
-			);
-			return;
-		};
 		pol_event!(
 			Severity::Info,
 			"inserting {key:?} into cache with TTL {}",
 			durfmt::format(ttl)
 		);
-		self.cache_store.insert(
-			key,
-			CachedExtAuthzResponse {
-				expires_at,
-				original_ttl: ttl,
-				refreshing: Arc::new(AtomicBool::new(false)),
-				response,
-			},
-		);
+		self.cache_store.insert(key, response, ttl);
 	}
 
 	fn cache_ttl(&self, req: &Request, cache: &CacheConfig) -> Option<Duration> {
@@ -865,7 +843,7 @@ impl ExtAuthz {
 			Ok(r) => r,
 			Err(e) => {
 				trace!("ext_authz failed {e}");
-				return self.handle_auth_failure(&e.to_string());
+				return self.handle_auth_failure();
 			},
 		};
 		if resp.status().is_success() {
@@ -884,7 +862,8 @@ impl ExtAuthz {
 				// response does not pass through the normal proxy response buffering hook,
 				// so inspect it whenever response metadata expressions are configured.
 				if let Err(e) = http::inspect_response_body(&mut resp).await {
-					return self.handle_auth_failure(&e.to_string());
+					warn!("ext_authz response body inspection failed: {e}");
+					return self.handle_auth_failure();
 				}
 				let m = metadata
 					.iter()
@@ -1237,39 +1216,7 @@ impl Hash for BytesKey {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct CachedExtAuthzResponse {
-	expires_at: Instant,
-	original_ttl: Duration,
-	refreshing: Arc<AtomicBool>,
-	response: CachedPolicyResponse,
-}
-
-impl CachedExtAuthzResponse {
-	fn is_expired(&self, now: Instant) -> bool {
-		self.expires_at <= now
-	}
-
-	fn lookup(&self, now: Instant) -> CacheLookup {
-		let Some(remaining) = self.expires_at.checked_duration_since(now) else {
-			return CacheLookup::Miss(CacheMissReason::ExpiredEntry);
-		};
-		if remaining > cache_refresh_threshold(self.original_ttl) {
-			return CacheLookup::Hit;
-		}
-		if self
-			.refreshing
-			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-			.is_ok()
-		{
-			CacheLookup::Refresh
-		} else {
-			CacheLookup::Hit
-		}
-	}
-}
-
-#[derive(Clone, Debug)]
-enum CachedPolicyResponse {
+pub(crate) enum CachedPolicyResponse {
 	Grpc(CachedGrpcPolicyResponse),
 	Http(CachedHttpPolicyResponse),
 }
@@ -1284,7 +1231,7 @@ impl CachedPolicyResponse {
 }
 
 #[derive(Clone, Debug)]
-enum CachedGrpcPolicyResponse {
+pub(crate) enum CachedGrpcPolicyResponse {
 	Allow {
 		headers: Vec<HeaderValueOption>,
 		headers_to_remove: Vec<String>,
@@ -1358,7 +1305,7 @@ impl CachedGrpcPolicyResponse {
 }
 
 #[derive(Clone, Debug)]
-enum CachedHttpPolicyResponse {
+pub(crate) enum CachedHttpPolicyResponse {
 	Allow {
 		headers: HeaderMap,
 		dynamic_metadata: Option<serde_json::Map<String, JsonValue>>,
@@ -1432,12 +1379,12 @@ fn unix_epoch_ttl(expires_at: f64) -> Option<Duration> {
 	Duration::try_from_secs_f64(expires_at - now).ok()
 }
 
-fn cache_refresh_threshold(ttl: Duration) -> Duration {
-	std::cmp::min(ttl / 10, Duration::from_secs(5))
-}
-
 fn should_cache_http_direct_response(status: StatusCode) -> bool {
 	matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+}
+
+fn default_max_request_bytes() -> u32 {
+	8192
 }
 
 pub(crate) fn default_cache_entries() -> usize {
@@ -1451,12 +1398,8 @@ pub(crate) fn effective_cache_entries(max_entries: usize) -> usize {
 	}
 }
 
-pub(crate) fn cache_store(max_entries: usize) -> Arc<Cache<CacheKey, CachedExtAuthzResponse>> {
-	Arc::new(Cache::new(max_entries))
-}
-
-pub(crate) fn default_cache_store() -> Arc<Cache<CacheKey, CachedExtAuthzResponse>> {
-	cache_store(DEFAULT_CACHE_ENTRIES)
+pub(crate) fn default_cache_store() -> ExpiringCache<CacheKey, CachedPolicyResponse> {
+	ExpiringCache::new(DEFAULT_CACHE_ENTRIES)
 }
 
 struct BufferedRequestBody {

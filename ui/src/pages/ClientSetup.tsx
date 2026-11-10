@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react';
 
 import claudeIcon from '@/assets/claude-color.svg';
 import codexIcon from '@/assets/codex-color.svg';
+import continueIcon from '@/assets/continue.svg';
 import curlIcon from '@/assets/curl.svg';
 import cursorIcon from '@/assets/cursor.svg';
 import gooseIcon from '@/assets/goose.svg';
@@ -44,6 +45,7 @@ type ClientRecipe = {
 	icon:
 		| 'claude'
 		| 'codex'
+		| 'continue'
 		| 'curl'
 		| 'cursor'
 		| 'copilot'
@@ -244,31 +246,39 @@ export function ClientSetupPage() {
 							label="Specific model"
 							hint="The dump lists a pattern; clients have to request a concrete model."
 						>
-							<div className="target-resolved-composite">
-								{wildcardModelPrefix(selectedModel) ? (
-									<span className="target-prefix">{wildcardModelPrefix(selectedModel)}</span>
-								) : null}
-								<input
-									aria-label="Specific model"
-									value={specificModel}
-									onChange={event => setSpecificModel(event.target.value)}
-									placeholder="Model name"
-								/>
-							</div>
+							{(id, hintId) => (
+								<div className="target-resolved-composite">
+									{wildcardModelPrefix(selectedModel) ? (
+										<span className="target-prefix">{wildcardModelPrefix(selectedModel)}</span>
+									) : null}
+									<input
+										id={id}
+										aria-label="Specific model"
+										aria-describedby={hintId}
+										value={specificModel}
+										onChange={event => setSpecificModel(event.target.value)}
+										placeholder="Model name"
+									/>
+								</div>
+							)}
 						</Field>
 					) : null}
 					{selectedModelConfig && isWildcardModelName(selectedModelConfig.name) ? (
 						<Field label="Specific model" hint="Model uses a wildcard; specify the specific model.">
-							<div className="target-resolved-composite">
-								{wildcardPrefix ? <span className="target-prefix">{wildcardPrefix}</span> : null}
-								<CatalogModelSelector
-									ariaLabel="Specific model"
-									value={specificModelSuffix}
-									provider={selectedCatalogProvider}
-									onChange={value => setSpecificModel(`${wildcardPrefix}${value}`)}
-									placeholder="Select or type a model"
-								/>
-							</div>
+							{(id, hintId) => (
+								<div className="target-resolved-composite">
+									{wildcardPrefix ? <span className="target-prefix">{wildcardPrefix}</span> : null}
+									<CatalogModelSelector
+										id={id}
+										ariaLabel="Specific model"
+										aria-describedby={hintId}
+										value={specificModelSuffix}
+										provider={selectedCatalogProvider}
+										onChange={value => setSpecificModel(`${wildcardPrefix}${value}`)}
+										placeholder="Select or type a model"
+									/>
+								</div>
+							)}
 						</Field>
 					) : null}
 					<FieldGroup label="Virtual API key">
@@ -457,6 +467,10 @@ function clientRecipes(args: { baseUrl: string; model: string; apiKey: string })
 	const openCodeApiKey = args.apiKey
 		? `,
         "apiKey": "{env:AGENTGATEWAY_API_KEY}"`
+		: '';
+	const continueApiKey = args.apiKey
+		? `
+    apiKey: ${JSON.stringify(args.apiKey)}`
 		: '';
 	const openCodeApiKeyExport = args.apiKey
 		? `
@@ -672,6 +686,30 @@ Custom model: ${args.model}`
 }`
 		},
 		{
+			id: 'continue',
+			title: 'Continue',
+			description: 'Connect Continue to agentgateway using an OpenAI-compatible model.',
+			icon: 'continue',
+			steps: [
+				<>
+					Add this configuration to <code>~/.continue/config.yaml</code>. If the file exists, add
+					the model to its <code>models</code> list.
+				</>,
+				<>
+					Save the file, then select <strong>agentgateway</strong> in the Continue model selector.
+				</>
+			],
+			language: 'text',
+			code: `name: agentgateway
+version: 0.0.1
+schema: v1
+models:
+  - name: agentgateway
+    provider: openai
+    model: ${JSON.stringify(args.model)}
+    apiBase: ${JSON.stringify(v1)}${continueApiKey}`
+		},
+		{
 			id: 'windsurf',
 			title: 'Windsurf',
 			description: 'Connect Windsurf to agentgateway using its HTTP proxy setting.',
@@ -776,6 +814,13 @@ function ClientSetupIcon(props: { recipe: ClientRecipe; compact?: boolean }) {
 		return (
 			<span className={className}>
 				<img src={githubCopilotIcon} alt="" aria-hidden="true" />
+			</span>
+		);
+	}
+	if (props.recipe.icon === 'continue') {
+		return (
+			<span className={className}>
+				<img src={continueIcon} alt="" aria-hidden="true" />
 			</span>
 		);
 	}

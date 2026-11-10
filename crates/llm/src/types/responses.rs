@@ -696,6 +696,15 @@ pub struct UsageInputDetails {
 	pub cached_tokens: Option<u64>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub cache_write_tokens: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub cache_write_tokens_details: Option<CacheWriteTokensDetails>,
+	#[serde(flatten, default)]
+	pub rest: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
+pub struct CacheWriteTokensDetails {
+	pub ttl_12h_tokens: Option<u64>,
 	#[serde(flatten, default)]
 	pub rest: serde_json::Value,
 }
@@ -1197,6 +1206,14 @@ impl ResponseType for Response {
 		};
 
 		LLMResponse {
+			cache_creation_1h_input_tokens: None,
+			cache_creation_12h_input_tokens: self.usage.as_ref().and_then(|u| {
+				u.input_tokens_details
+					.as_ref()
+					.and_then(|d| d.cache_write_tokens_details.as_ref())
+					.and_then(|d| d.ttl_12h_tokens)
+			}),
+			usage_lines: Vec::new(),
 			input_tokens: self.usage.as_ref().map(|u| u.input_tokens),
 			input_image_tokens: None,
 			input_text_tokens: None,
@@ -1214,6 +1231,7 @@ impl ResponseType for Response {
 				.as_ref()
 				.map(|u| u.total_tokens.unwrap_or(u.input_tokens + u.output_tokens)),
 			pages: None,
+			audio_seconds: None,
 			reasoning_tokens: self.usage.as_ref().and_then(|u| {
 				u.output_tokens_details
 					.as_ref()
@@ -1332,6 +1350,22 @@ impl ResponseType for Response {
 				);
 				continue;
 			}
+			if let OutputItem::Reasoning(reasoning) = o {
+				use async_openai::types::responses as sdk;
+				for sdk::SummaryPart::SummaryText(summary) in &mut reasoning.summary {
+					f(ContentScope::Messages.into(), &mut summary.text);
+				}
+				// encrypted_content may embed this text; a mask would not cover it and would break replay.
+				let content = crate::types::ResponseText {
+					scope: ContentScope::Messages,
+					signed: reasoning.encrypted_content.is_some(),
+				};
+				for sdk::ReasoningItemContent::ReasoningText(text) in reasoning.content.iter_mut().flatten()
+				{
+					f(content, &mut text.text);
+				}
+				continue;
+			}
 			let mut plain = |scope: ContentScope, text: &mut String| f(scope.into(), text);
 			let f = &mut plain;
 			let OutputItem::Message(msg) = o else {
@@ -1376,8 +1410,9 @@ pub mod typed {
 		ResponseFunctionCallArgumentsDoneEvent, ResponseInProgressEvent, ResponseIncompleteEvent,
 		ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponseReasoningTextDeltaEvent,
 		ResponseReasoningTextDoneEvent, ResponseRefusalDeltaEvent, ResponseRefusalDoneEvent,
-		ResponseTextDeltaEvent, ResponseTextDoneEvent, ResponseTextParam, ResponseUsage, Role, Status,
-		TextResponseFormatConfiguration, Tool, ToolChoiceFunction, ToolChoiceOptions, ToolChoiceParam,
+		ResponseTextDeltaEvent, ResponseTextDoneEvent, ResponseTextParam, ResponseUsage, Role,
+		ServiceTierResponses, Status, TextResponseFormatConfiguration, Tool, ToolChoiceFunction,
+		ToolChoiceOptions, ToolChoiceParam,
 	};
 	use serde::{Deserialize, Serialize};
 

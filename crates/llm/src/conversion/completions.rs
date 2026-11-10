@@ -94,6 +94,7 @@ pub mod from_messages {
 	use types::completions::typed as completions;
 	use types::messages::typed as messages;
 
+	use crate::conversion::GeminiThoughtSignature;
 	use crate::parse::sse::SseJsonEvent;
 	use crate::types::ResponseType;
 	use crate::{AIError, StreamingUsageGuard, json, logged_response_parsing, types};
@@ -122,6 +123,7 @@ pub mod from_messages {
 				.completion_tokens_details
 				.as_ref()
 				.and_then(|d| d.reasoning_tokens),
+			..Default::default()
 		});
 		let anthropic = translate_response_internal(resp)?;
 		Ok(Box::new(super::super::ResponseWithProviderUsage {
@@ -170,7 +172,7 @@ pub mod from_messages {
 		// Engines report reasoning beside the text; the Messages contract puts it first. A turn whose
 		// reasoning text is withheld carries the signature alone, so the signature is enough to send
 		// the block: it is what the next turn has to replay.
-		let thinking = choice.message.reasoning_content.unwrap_or_default();
+		let thinking = choice.message.reasoning().unwrap_or_default().to_string();
 		let signature = choice.message.reasoning_signature.unwrap_or_default();
 		if !thinking.is_empty() || !signature.is_empty() {
 			content.push(messages::ContentBlock::Thinking {
@@ -179,26 +181,20 @@ pub mod from_messages {
 			});
 		}
 		if let Some(text) = choice.message.content {
-			content.push(messages::ContentBlock::Text(messages::ContentTextBlock {
-				text,
-				citations: None,
-				cache_control: None,
-			}));
+			content.push(messages::ContentBlock::text(text));
 		}
-		if let Some(tool_calls) = choice.message.tool_calls {
-			content.extend(tool_calls.into_iter().filter_map(|tc| match tc {
-				completions::MessageToolCalls::Function(f) => {
-					let input = crate::conversion::tool_arguments_to_input(&f.function.arguments);
-					Some(messages::ContentBlock::ToolUse {
-						id: f.id,
-						name: f.function.name,
-						input,
-						cache_control: None,
-					})
-				},
-				completions::MessageToolCalls::Custom(_) => None,
-			}));
-		}
+		content.extend(
+			choice
+				.message
+				.tool_calls
+				.into_iter()
+				.flatten()
+				.filter_map(|tc| match tc {
+					completions::MessageToolCalls::Function(call) => Some(call),
+					completions::MessageToolCalls::Custom(_) => None,
+				})
+				.flat_map(tool_call_blocks),
+		);
 
 		let (mut stop_reason, may_have_stop_sequence) = match choice.finish_reason {
 			Some(completions::FinishReason::Stop) => (messages::StopReason::EndTurn, true),
@@ -233,10 +229,7 @@ pub mod from_messages {
 				.map(|tokens| tokens as usize)
 		});
 		Ok(messages::MessagesResponse {
-			id,
-			r#type: "message".to_string(),
-			role: messages::Role::Assistant,
-			model,
+			content,
 			stop_reason: Some(stop_reason),
 			stop_sequence,
 			usage: messages::Usage {
@@ -253,6 +246,7 @@ pub mod from_messages {
 				cache_creation_input_tokens,
 				cache_read_input_tokens,
 				service_tier,
+				..Default::default()
 			},
 			input_audio_tokens: usage.as_ref().and_then(|u| {
 				u.prompt_tokens_details
@@ -266,8 +260,27 @@ pub mod from_messages {
 					.and_then(|d| d.audio_tokens)
 					.map(|t| t as usize)
 			}),
-			content,
+			..messages::MessagesResponse::start(id, model)
 		})
+	}
+
+	/// A Gemini thought signature rides in a `Thinking` block placed before the tool call it belongs to.
+	fn tool_call_blocks(
+		call: completions::MessageToolCall,
+	) -> impl Iterator<Item = messages::ContentBlock> {
+		let thinking = call
+			.thought_signature()
+			.map(|signature| messages::ContentBlock::Thinking {
+				thinking: String::new(),
+				signature: GeminiThoughtSignature::encode(&call.id, signature),
+			});
+		let tool_use = messages::ContentBlock::ToolUse {
+			input: crate::conversion::tool_arguments_to_input(&call.function.arguments),
+			id: call.id,
+			name: call.function.name,
+			cache_control: None,
+		};
+		thinking.into_iter().chain(std::iter::once(tool_use))
 	}
 
 	pub fn translate_stream(
@@ -408,11 +421,7 @@ pub mod from_messages {
 				events,
 				messages::MessagesStreamEvent::ContentBlockStart {
 					index,
-					content_block: messages::ContentBlock::Text(messages::ContentTextBlock {
-						text: "".to_string(),
-						citations: None,
-						cache_control: None,
-					}),
+					content_block: messages::ContentBlock::text("".to_string()),
 				},
 			);
 			index
@@ -538,6 +547,7 @@ pub mod from_messages {
 						output_tokens: Some(output_tokens),
 						cache_creation_input_tokens,
 						cache_read_input_tokens,
+						..Default::default()
 					},
 				},
 			);
@@ -601,24 +611,7 @@ pub mod from_messages {
 						push_event(
 							&mut events,
 							messages::MessagesStreamEvent::MessageStart {
-								message: messages::MessagesResponse {
-									id: f.id.clone(),
-									r#type: "message".to_string(),
-									role: messages::Role::Assistant,
-									content: vec![],
-									model: f.model.clone(),
-									stop_reason: None,
-									stop_sequence: None,
-									usage: messages::Usage {
-										input_tokens: 0,
-										output_tokens: 0,
-										cache_creation_input_tokens: None,
-										cache_read_input_tokens: None,
-										service_tier: None,
-									},
-									input_audio_tokens: None,
-									output_audio_tokens: None,
-								},
+								message: messages::MessagesResponse::start(f.id.clone(), f.model.clone()),
 							},
 						);
 
@@ -630,12 +623,7 @@ pub mod from_messages {
 					}
 
 					if let Some(choice) = f.choices.first() {
-						if let Some(thinking) = choice
-							.delta
-							.reasoning_content
-							.as_deref()
-							.filter(|s| !s.is_empty())
-						{
+						if let Some(thinking) = choice.delta.reasoning() {
 							let index = open_thinking_block(&mut state, &mut events);
 							maybe_set_first_token(&mut state, &log);
 							push_event(
@@ -851,6 +839,7 @@ pub mod from_messages {
 			metadata,
 			thinking,
 			output_config,
+			cache_control: _,
 		} = req;
 
 		// Explicit prompt-cache breakpoints are accepted only by GPT 5.6 and newer models.
@@ -1059,6 +1048,17 @@ pub mod from_messages {
 					}
 				},
 				messages::Role::Assistant => {
+					let mut gemini_signatures: HashMap<_, _> = msg
+						.content
+						.iter()
+						.filter_map(|block| match block {
+							messages::ContentBlock::Thinking { signature, .. } => {
+								crate::conversion::GeminiThoughtSignature::decode(signature)
+							},
+							_ => None,
+						})
+						.map(|value| (value.call_id, value.signature))
+						.collect();
 					let mut assistant_parts = Vec::new();
 					let mut tool_calls: Vec<completions::MessageToolCalls> = Vec::new();
 					let mut reasoning_content: Option<String> = None;
@@ -1078,21 +1078,28 @@ pub mod from_messages {
 							messages::ContentBlock::ToolUse {
 								id, name, input, ..
 							} => {
-								tool_calls.push(completions::MessageToolCalls::Function(
-									completions::MessageToolCall {
-										id,
-										function: completions::FunctionCall {
-											name,
-											arguments: serde_json::to_string(&input).unwrap_or_default(),
-										},
+								let signature = gemini_signatures.remove(&id);
+								let mut call = completions::MessageToolCall {
+									id,
+									function: completions::FunctionCall {
+										name,
+										arguments: serde_json::to_string(&input).unwrap_or_default(),
 									},
-								));
+									extra_content: None,
+								};
+								if let Some(signature) = signature {
+									call.set_thought_signature(signature);
+								}
+								tool_calls.push(completions::MessageToolCalls::Function(call));
 							},
 							// Chat Completions carries one reasoning text per turn, so the blocks are joined.
 							messages::ContentBlock::Thinking {
 								thinking,
 								signature,
 							} => {
+								if GeminiThoughtSignature::decode(&signature).is_some() {
+									continue;
+								}
 								match reasoning_content.as_mut() {
 									Some(text) => {
 										text.push_str("\n\n");

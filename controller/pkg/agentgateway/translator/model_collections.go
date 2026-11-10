@@ -164,10 +164,15 @@ func backendRefToTypedNamespacedName(namespace string, ref *agentgateway.LocalBa
 // Gateway listeners. The referenced HTTPRoute rule supplies normal routing and
 // policy behavior; models populate its generated LLM router backend.
 func extractModelParentReferenceInfo(ctx RouteContext, model *agentgateway.AgentgatewayModel) []RouteParentReference {
-	parents := extractParentReferenceInfo(ctx, ctx.RouteParents, model)
+	parents := extractParentReferenceInfo(ctx, model)
+	cloned := false
 	for _, ref := range model.Spec.ParentRefs {
 		if NormalizeReference(ref.Group, ref.Kind, wellknown.GatewayGVK.GroupKind()) != wellknown.HTTPRouteGVK.GroupKind() {
 			continue
+		}
+		if !cloned {
+			parents = slices.Clone(parents)
+			cloned = true
 		}
 		namespace := defaultString(ref.Namespace, model.Namespace)
 		rejected := func(message string) RouteParentReference {
@@ -211,7 +216,7 @@ func extractModelParentReferenceInfo(ctx RouteContext, model *agentgateway.Agent
 				continue
 			}
 		}
-		for _, gatewayParent := range FilteredReferences(extractParentReferenceInfo(ctx, ctx.RouteParents, route)) {
+		for _, gatewayParent := range FilteredReferences(extractParentReferenceInfo(ctx, route)) {
 			gatewayParent.OriginalReference = ref
 			gatewayParent.ParentKey = utils.TypedNamespacedName{Namespace: namespace, Name: route.Name, Kind: wellknown.HTTPRouteKind}
 			gatewayParent.ParentSection = ptr.OrEmpty(ref.SectionName)
@@ -255,7 +260,7 @@ func modelServingRuleMatchesRoot(rule gwv1.HTTPRouteRule) bool {
 
 func rootModelRouteDirectListenerConflicts(ctx RouteContext, route *gwv1.HTTPRoute) []string {
 	routeListeners := make(map[string]struct{})
-	for _, parent := range FilteredReferences(extractParentReferenceInfo(ctx, ctx.RouteParents, route)) {
+	for _, parent := range FilteredReferences(extractParentReferenceInfo(ctx, route)) {
 		routeListeners[parent.ListenerKey] = struct{}{}
 	}
 	if len(routeListeners) == 0 {
@@ -264,7 +269,7 @@ func rootModelRouteDirectListenerConflicts(ctx RouteContext, route *gwv1.HTTPRou
 
 	conflicts := make(map[string]struct{})
 	for _, model := range krt.Fetch(ctx.Krt, ctx.Models) {
-		for _, parent := range FilteredReferences(extractParentReferenceInfo(ctx, ctx.RouteParents, model)) {
+		for _, parent := range FilteredReferences(extractParentReferenceInfo(ctx, model)) {
 			if _, found := routeListeners[parent.ListenerKey]; found {
 				conflicts[parent.ListenerKey] = struct{}{}
 			}
@@ -468,22 +473,20 @@ func convertAgentgatewayModel(ctx RouteContext, model *agentgateway.Agentgateway
 				Backend:         backendRef(backend.Key),
 			},
 		}
-		if strings.Contains(effectiveModelName(model), "*") {
-			provider := strings.ToLower(string(*model.Spec.Provider))
-			switch *model.Spec.Provider {
-			case agentgateway.ModelProviderGemini:
-				provider = "gcp.gemini"
-			case agentgateway.ModelProviderVertexAI:
-				provider = "gcp.vertex_ai"
-			case agentgateway.ModelProviderBedrock:
-				provider = "aws.bedrock"
-			case agentgateway.ModelProviderCustom:
-				if model.Spec.Custom.ProviderOverride != nil {
-					provider = *model.Spec.Custom.ProviderOverride
-				}
+		provider := strings.ToLower(string(*model.Spec.Provider))
+		switch *model.Spec.Provider {
+		case agentgateway.ModelProviderGemini:
+			provider = "gcp.gemini"
+		case agentgateway.ModelProviderVertexAI:
+			provider = "gcp.vertex_ai"
+		case agentgateway.ModelProviderBedrock:
+			provider = "aws.bedrock"
+		case agentgateway.ModelProviderCustom:
+			if model.Spec.Custom.ProviderOverride != nil {
+				provider = *model.Spec.Custom.ProviderOverride
 			}
-			route.GetConcreteModel().DiscoveryProvider = &provider
 		}
+		route.GetConcreteModel().DiscoveryProvider = &provider
 		resources = append(resources, backendResource(backend))
 	} else if model.Spec.VirtualModel != nil {
 		virtual, generated, err := translateVirtualModel(ctx, model, parent)
@@ -715,6 +718,8 @@ func translateModelLLMProvider(ctx RouteContext, namespace string, model *agentg
 	switch {
 	case llm.OpenAI != nil:
 		provider.Provider = &api.AIBackend_Provider_Openai{Openai: &api.AIBackend_OpenAI{Model: providerModel(selectedModel, llm.OpenAI.Model)}}
+	case llm.Copilot != nil:
+		provider.Provider = &api.AIBackend_Provider_Copilot{Copilot: &api.AIBackend_Copilot{Model: providerModel(selectedModel, llm.Copilot.Model)}}
 	case llm.Azure != nil:
 		resourceType := api.AIBackend_OPEN_AI
 		if llm.Azure.ResourceType == agentgateway.AzureResourceTypeFoundry {
@@ -850,6 +855,8 @@ func modelLLMProvider(model *agentgateway.AgentgatewayModelSpec) (*agentgateway.
 	switch *model.Provider {
 	case agentgateway.ModelProviderOpenAI:
 		provider.OpenAI = &agentgateway.OpenAIConfig{}
+	case agentgateway.ModelProviderCopilot:
+		provider.Copilot = &agentgateway.CopilotConfig{}
 	case agentgateway.ModelProviderAzure:
 		if model.Azure == nil {
 			return nil, fmt.Errorf("azure provider requires azure configuration")

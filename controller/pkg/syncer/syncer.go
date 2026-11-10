@@ -153,7 +153,7 @@ func (s *Syncer) buildResourceCollections(krtopts krtutil.KrtOptions) {
 		referenceTypes.KnownToReferences,
 		krtopts,
 	))
-	listenerSetInitialStatus, listenerSets := s.buildListenerSetCollection(gatewayClasses, refGrants, krtopts)
+	listenerSetInitialStatus, listenerSets := s.buildListenerSetCollection(gatewayClasses, refGrants, referenceTypes, krtopts)
 	listenerSets, rejectedListenerSets := s.joinExtraListenerSets(listenerSets, krtopts)
 	if s.customResourceCollections != nil {
 		s.customResourceCollections(CustomResourceCollectionsConfig{
@@ -170,7 +170,7 @@ func (s *Syncer) buildResourceCollections(krtopts krtutil.KrtOptions) {
 		})
 	}
 
-	gatewayInitialStatus, gateways := s.buildGatewayCollection(gatewayClasses, listenerSets, refGrants, krtopts)
+	gatewayInitialStatus, gateways := s.buildGatewayCollection(gatewayClasses, listenerSets, refGrants, referenceTypes, krtopts)
 
 	// Build Agw resources for gateway
 	agwResources, routeAttachments, ancestorCollection := s.buildAgwResources(gateways, listenerSets, refGrants, referenceTypes, krtopts)
@@ -369,6 +369,7 @@ func (s *Syncer) buildGatewayCollection(
 	gatewayClasses krt.Collection[translator.GatewayClass],
 	listenerSets krt.Collection[*translator.ListenerSet],
 	refGrants translator.ReferenceGrants,
+	referenceTypes plugins.ReferenceTypes,
 	krtopts krtutil.KrtOptions,
 ) (
 	krt.StatusCollection[*gwv1.Gateway, gwv1.GatewayStatus],
@@ -383,6 +384,9 @@ func (s *Syncer) buildGatewayCollection(
 		Grants:                   refGrants,
 		Secrets:                  s.agwCollections.Secrets,
 		ConfigMaps:               s.agwCollections.ConfigMaps,
+		ClusterTrustBundles:      s.agwCollections.ClusterTrustBundles,
+		References:               referenceTypes,
+		BackendRefGrantMode:      s.agwCollections.Settings.BackendRefGrantMode,
 		KrtOpts:                  krtopts,
 		EnableAgentgatewayModels: s.agwCollections.Settings.EnableAgentgatewayModels,
 	}, s.gatewayCollectionOptions...)
@@ -391,6 +395,7 @@ func (s *Syncer) buildGatewayCollection(
 func (s *Syncer) buildListenerSetCollection(
 	gatewayClasses krt.Collection[translator.GatewayClass],
 	refGrants translator.ReferenceGrants,
+	referenceTypes plugins.ReferenceTypes,
 	krtopts krtutil.KrtOptions,
 ) (
 	krt.StatusCollection[*gwv1.ListenerSet, gwv1.ListenerSetStatus],
@@ -407,6 +412,9 @@ func (s *Syncer) buildListenerSetCollection(
 				refGrants,
 				s.agwCollections.Secrets,
 				s.agwCollections.ConfigMaps,
+				s.agwCollections.ClusterTrustBundles,
+				referenceTypes,
+				s.agwCollections.Settings.BackendRefGrantMode,
 				s.agwCollections.Settings.EnableAgentgatewayModels,
 			)
 		}, krtopts.ToOptions("translator/ListenerSetListeners")...)
@@ -456,7 +464,7 @@ func (s *Syncer) joinExtraListenerSets(
 	krtopts krtutil.KrtOptions,
 ) (krt.Collection[*translator.ListenerSet], krt.Collection[RejectedListenerSet]) {
 	noRejections := func() krt.Collection[RejectedListenerSet] {
-		return krt.NewStaticCollection[RejectedListenerSet](nil, nil,
+		return krt.NewDisabledCollection[RejectedListenerSet](
 			krtopts.ToOptions("translator/RejectedExtraListenerSets")...)
 	}
 	if s.extraListenerSets == nil {
@@ -570,13 +578,16 @@ func (s *Syncer) buildAgwResources(
 ) (krt.Collection[agwir.AgwResource], krt.Collection[*plugins.RouteAttachment], plugins.ReferenceIndex) {
 	// filter gateway collections to only include gateways which use a built-in gateway class
 	// (resources for additional gateway classes should be created by the downstream providing them)
-	filteredGateways := krt.NewCollection(gateways, func(ctx krt.HandlerContext, gw *translator.GatewayListener) **translator.GatewayListener {
+	routeGateways := krt.NewCollection(gateways, func(ctx krt.HandlerContext, gw *translator.GatewayListener) **translator.GatewayListener {
 		if _, isAdditionalClass := s.additionalGatewayClasses[gw.ParentInfo.ParentGatewayClassName]; isAdditionalClass {
 			return nil
 		}
-		if gw.Conflict == translator.ListenerConflictBindMode {
-			// Bind mode is selected by listener precedence. Keep the losing listener
-			// available to status reporting, but do not program it or attach routes.
+		return &gw
+	}, krtopts.ToOptions("translator/RouteGateways")...)
+
+	// Keep conflicted parents for attachment status, but do not program them.
+	filteredGateways := krt.NewCollection(routeGateways, func(ctx krt.HandlerContext, gw *translator.GatewayListener) **translator.GatewayListener {
+		if gw.Conflict != "" {
 			return nil
 		}
 		return &gw
@@ -596,18 +607,8 @@ func (s *Syncer) buildAgwResources(
 	}
 	binds := krt.JoinCollection(bindCollections, krtopts.ToOptions("resources/Binds")...)
 
-	// Build listeners
-	baseListeners := krt.NewCollection(filteredGateways, func(ctx krt.HandlerContext, obj *translator.GatewayListener) *agwir.AgwResource {
-		return s.buildListenerFromGateway(obj)
-	}, krtopts.ToOptions("translator/Listeners")...)
-	listenerCollections := []krt.Collection[agwir.AgwResource]{baseListeners}
-	if s.agwPlugins.AddResourceExtension != nil && s.agwPlugins.AddResourceExtension.Listeners != nil {
-		listenerCollections = append(listenerCollections, s.agwPlugins.AddResourceExtension.Listeners)
-	}
-	listeners := krt.JoinCollection(listenerCollections, krtopts.ToOptions("resources/Listeners")...)
-
 	// Build routes
-	var routeParents translator.ParentResolver = translator.BuildRouteParents(filteredGateways)
+	var routeParents translator.ParentResolver = translator.BuildRouteParents(routeGateways, krtopts)
 
 	// Compose with plugin-provided parent resolvers.
 	if ext := s.agwPlugins.AddResourceExtension; ext != nil && len(ext.ParentResolvers) > 0 {
@@ -636,6 +637,25 @@ func (s *Syncer) buildAgwResources(
 		References:          referenceTypes,
 		BackendRefGrantMode: s.agwCollections.Settings.BackendRefGrantMode,
 	}
+	routeInputs.ParentRefs = translator.RouteParentRefsCollection(
+		routeInputs,
+		s.agwCollections.HTTPRoutes,
+		s.agwCollections.GRPCRoutes,
+		s.agwCollections.TCPRoutes,
+		s.agwCollections.TLSRoutes,
+		s.agwCollections.Models,
+		krtopts,
+	)
+
+	// Build listeners
+	baseListeners := krt.NewCollection(filteredGateways, func(ctx krt.HandlerContext, obj *translator.GatewayListener) *agwir.AgwResource {
+		return s.buildListenerFromGateway(obj)
+	}, krtopts.ToOptions("translator/Listeners")...)
+	listenerCollections := []krt.Collection[agwir.AgwResource]{baseListeners}
+	if s.agwPlugins.AddResourceExtension != nil && s.agwPlugins.AddResourceExtension.Listeners != nil {
+		listenerCollections = append(listenerCollections, s.agwPlugins.AddResourceExtension.Listeners)
+	}
+	listeners := krt.JoinCollection(listenerCollections, krtopts.ToOptions("resources/Listeners")...)
 
 	baseAgwRoutes, routeAttachments, ancestorBackends := translator.AgwRouteCollection(s.statusCollections, s.agwCollections.HTTPRoutes, s.agwCollections.GRPCRoutes, s.agwCollections.TCPRoutes, s.agwCollections.TLSRoutes, routeInputs, krtopts)
 	routeCollections := []krt.Collection[agwir.AgwResource]{baseAgwRoutes}
@@ -657,6 +677,14 @@ func (s *Syncer) buildAgwResources(
 	routeAttachmentsIndex := krt.NewIndex(routeAttachments, "from", func(o *plugins.RouteAttachment) []utils.TypedNamespacedName {
 		return []utils.TypedNamespacedName{o.From}
 	}).AsCollection(append(krtopts.ToOptions("translator/RouteAttachmentsBySource"), utils.TypedNamespacedNameIndexCollectionFunc)...)
+
+	listenerFilterAncestors := krt.NewManyCollection(gatewayParents, func(krtctx krt.HandlerContext, object krt.IndexObject[string, *translator.GatewayListener]) []*utils.AncestorBackend {
+		if len(object.Objects) == 0 {
+			return nil
+		}
+		return translator.ListenerFilterAncestorBackends(routeInputs.WithCtx(krtctx), object.Objects[0].ParentGateway, object.Objects)
+	}, krtopts.ToOptions("translator/ListenerFilterAncestors")...)
+	ancestorBackends = krt.JoinCollection([]krt.Collection[*utils.AncestorBackend]{ancestorBackends, listenerFilterAncestors}, krtopts.ToOptions("translator/AncestorBackendsWithListenerFilters")...)
 
 	ancestorsIndex := krt.NewIndex(ancestorBackends, "ancestors", func(o *utils.AncestorBackend) []utils.TypedNamespacedName {
 		return []utils.TypedNamespacedName{o.Backend}
@@ -791,10 +819,14 @@ func (s *Syncer) buildListenerFromGateway(obj *translator.GatewayListener) *agwi
 	}
 	listenerName := utils.ListenerName(obj.ParentGateway.Namespace, obj.ParentGateway.Name, string(obj.ParentInfo.SectionName), ls)
 	l := &api.Listener{
-		Key:      obj.ResourceName(),
-		Name:     listenerName,
-		BindKey:  fmt.Sprint(obj.ParentInfo.Port) + "/" + obj.ParentGateway.Namespace + "/" + obj.ParentGateway.Name,
-		Hostname: obj.ParentInfo.OriginalHostname,
+		Key:             obj.ResourceName(),
+		Name:            listenerName,
+		BindKey:         fmt.Sprint(obj.ParentInfo.Port) + "/" + obj.ParentGateway.Namespace + "/" + obj.ParentGateway.Name,
+		Hostname:        obj.ParentInfo.OriginalHostname,
+		TrafficPolicies: obj.FilterResult.Policies,
+	}
+	if obj.FilterResult.Error != "" {
+		l.Error = &obj.FilterResult.Error
 	}
 
 	// Set protocol and TLS configuration
@@ -862,12 +894,12 @@ func defaultBuildAddressCollections(cols *plugins.AgwCollections, krtopts krtuti
 		meshConfig,
 		// Authz/Authn are not use for agentgateway, ignore
 		krt.NewIndex(
-			krt.NewStaticCollection[model.WorkloadAuthorization](nil, nil, krtopts.ToOptions("addresses/DisabledWorkloadAuthorization")...),
+			krt.NewDisabledCollection[model.WorkloadAuthorization](krtopts.ToOptions("addresses/DisabledWorkloadAuthorization")...),
 			"byNS",
 			func(model.WorkloadAuthorization) []string { return nil },
 		),
 		krt.NewNamespaceIndex(
-			krt.NewStaticCollection[*securityclient.PeerAuthentication](nil, nil, krtopts.ToOptions("addresses/DisabledPeerAuthentication")...),
+			krt.NewDisabledCollection[*securityclient.PeerAuthentication](krtopts.ToOptions("addresses/DisabledPeerAuthentication")...),
 		),
 		waypoints,
 		services,

@@ -76,6 +76,12 @@ pub fn default_standalone_config(database_url: &str) -> serde_json::Value {
 #[path = "local_tests.rs"]
 mod tests;
 
+pub fn expand_env(s: &str) -> anyhow::Result<String> {
+	// Avoid shell expanding the comment for schema. Probably there are better ways to do this!
+	let s = s.replace("# yaml-language-server: $schema", "#");
+	Ok(shellexpand::full(&s)?.into_owned())
+}
+
 impl NormalizedLocalConfig {
 	pub async fn from(
 		config: &crate::Config,
@@ -83,9 +89,16 @@ impl NormalizedLocalConfig {
 		gateway_name: ListenerTarget,
 		s: &str,
 	) -> anyhow::Result<NormalizedLocalConfig> {
-		// Avoid shell expanding the comment for schema. Probably there are better ways to do this!
-		let s = s.replace("# yaml-language-server: $schema", "#");
-		let s = shellexpand::full(&s)?;
+		Self::from_expanded(config, resources, gateway_name, expand_env(s)?).await
+	}
+
+	/// Like `from`, for config that already had environment variables expanded.
+	pub async fn from_expanded(
+		config: &crate::Config,
+		resources: &crate::resource_manager::ResourceFetcher,
+		gateway_name: ListenerTarget,
+		s: String,
+	) -> anyhow::Result<NormalizedLocalConfig> {
 		let mut registration_config = config.clone();
 		let registration_policy = Arc::new(config.budget_policy.registration_policy());
 		registration_config.budget_policy = registration_policy.clone();
@@ -934,7 +947,7 @@ pub struct SecretFromFile(
 	#[cfg_attr(feature = "schema", schemars(with = "FileOrInline"))]
 	#[serde(
 		serialize_with = "ser_redact",
-		deserialize_with = "deser_key_from_file"
+		deserialize_with = "deser_watched_secret"
 	)]
 	SecretString,
 );
@@ -1751,6 +1764,15 @@ impl LocalBackend {
 				if tgt.targets.len() <= 1 && tgt.targets.iter().any(|target| target.condition.is_some()) {
 					bail!("mcp target condition requires at least two configured targets");
 				}
+				if let Some(dup) = tgt
+					.targets
+					.iter()
+					.map(|t| t.name.as_str())
+					.duplicates()
+					.next()
+				{
+					bail!("duplicate mcp target name {dup:?}");
+				}
 				let mut targets = vec![];
 				let mut backends = vec![];
 				for (idx, t) in tgt.targets.iter().enumerate() {
@@ -1809,7 +1831,7 @@ impl LocalBackend {
 							}
 						},
 						LocalMcpTargetSpec::OpenAPI { backend, schema } => {
-							let (bref, _, be) = Self::process_mcp_backend(
+							let (bref, path, be) = Self::process_mcp_backend(
 								local_name(name.clone()),
 								backend,
 								t.policies.clone(),
@@ -1821,9 +1843,17 @@ impl LocalBackend {
 							}
 
 							let openapi_schema = schema.load_openapi_schema(resources).await?;
+							// A root path is indistinguishable from an absent one in host URIs, so both use the schema.
+							let prefix = match path.as_deref().filter(|p| !p.is_empty() && *p != "/") {
+								Some(p) => validate_openapi_prefix(p)
+									.map_err(|e| anyhow!("openapi MCP target '{}': {e}", t.name))?,
+								None => crate::mcp::openapi_server_prefix(&openapi_schema)
+									.map_err(|e| anyhow!("openapi MCP target '{}': {e}", t.name))?,
+							};
 							McpTargetSpec::OpenAPI(OpenAPITarget {
 								backend: bref,
 								schema: openapi_schema.into(),
+								prefix,
 							})
 						},
 					};
@@ -2094,6 +2124,21 @@ impl<'de> serde::Deserialize<'de> for McpBackendHost {
 	}
 }
 
+// The prefix is formatted directly after the authority, so anything but a plain path could
+// rewrite the upstream URL.
+fn validate_openapi_prefix(prefix: &str) -> anyhow::Result<String> {
+	if !prefix.starts_with('/')
+		|| prefix.starts_with("//")
+		|| prefix.contains(['?', '#', '\\'])
+		|| prefix.parse::<::http::uri::PathAndQuery>().is_err()
+	{
+		anyhow::bail!(
+			"path must start with a single '/' and must not contain a query, fragment, or backslash"
+		);
+	}
+	Ok(prefix.to_string())
+}
+
 impl McpBackendHost {
 	pub fn process(&self) -> anyhow::Result<ProcessedMcpBackendHost> {
 		Ok(match self {
@@ -2103,6 +2148,13 @@ impl McpBackendHost {
 			},
 			McpBackendHost::Host { host, port, path } => match (host, port, path) {
 				(host, Some(port), Some(path)) => {
+					if host.parse::<IpAddr>().is_err() {
+						let authority =
+							::http::uri::Authority::try_from(host.as_str()).context("invalid MCP host")?;
+						if authority.host() != host {
+							anyhow::bail!("invalid MCP host: expected only a hostname or IP address");
+						}
+					}
 					let b = Target::from((host.as_str(), *port));
 					ProcessedMcpBackendHost::Inline {
 						backend: b,
@@ -2164,6 +2216,8 @@ pub enum LocalMcpTargetSpec {
 		#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 		clear_env: bool,
 	},
+	/// Expose the operations in an OpenAPI schema as MCP tools.
+	/// A non-root path in `host` or `path` replaces the schema's server path.
 	#[serde(rename = "openapi")]
 	OpenAPI {
 		#[serde(flatten)]
@@ -3888,6 +3942,7 @@ async fn convert_gateway_listener(
 		name: name.clone(),
 		hostname: hostname.unwrap_or_else(|| strng::new("*")),
 		protocol,
+		..Default::default()
 	};
 	let mut all_policies = Vec::new();
 	if !policies.is_empty() {
@@ -4053,10 +4108,6 @@ fn ui_oidc_redirect_path(policies: Option<&LocalUIPolicy>) -> anyhow::Result<Opt
 
 #[cfg(any(not(test), target_family = "unix"))]
 static STARTUP_TIMESTAMP: OnceLock<u64> = OnceLock::new();
-
-fn llm_model_match_specificity(model_name: &str) -> usize {
-	model_name.chars().filter(|c| *c != '*').count()
-}
 
 fn validate_llm_model_pattern(pattern: &str) -> anyhow::Result<()> {
 	let wildcard_count = pattern.chars().filter(|c| *c == '*').count();
@@ -4450,7 +4501,7 @@ impl LocalLLMModelRegistry {
 			.enumerate()
 			.sorted_by_key(|(original_idx, model)| {
 				(
-					std::cmp::Reverse(llm_model_match_specificity(&model.name)),
+					std::cmp::Reverse(llm::model_router::model_match_specificity(&model.name)),
 					*original_idx,
 				)
 			})
@@ -4724,32 +4775,15 @@ async fn convert_llm_config(
 			pols.push(BackendTrafficPolicy::backend_auth(backend_auth));
 		}
 
-		let discovery = if !model_config.name.contains('*')
-			|| provider.override_model().is_some()
-			|| model_config
-				.overrides
-				.as_ref()
-				.is_some_and(|p| p.contains_key("model"))
-			|| model_config
-				.final_transformation
-				.as_ref()
-				.is_some_and(|p| p.contains_key("model"))
-		{
-			None
-		} else {
-			match model_config
+		let discovery = llm::discovery::ModelDiscovery::new(
+			provider.provider(),
+			provider.override_model(),
+			model_config
 				.transformation
 				.as_ref()
 				.and_then(|p| p.get("model"))
-			{
-				Some(expression) => llm::model_transform::reverse_model_transformation(expression),
-				None => Some(llm::model_transform::ModelTransformation::Identity),
-			}
-			.map(|transformation| llm::discovery::ModelDiscovery {
-				provider: provider.provider(),
-				transformation,
-			})
-		};
+				.map(AsRef::as_ref),
+		);
 
 		// Create AI backend
 		let named_provider = NamedAIProvider {
@@ -4963,11 +4997,11 @@ async fn convert_llm_config(
 	});
 
 	routes.push(Route {
-		key: strng::new("llm:request"),
+		key: strng::new(llm::LOCAL_ROUTE_NAME),
 		service_key: None,
 		service_port: 0,
 		name: RouteName {
-			name: strng::new("llm:request"),
+			name: strng::new(llm::LOCAL_ROUTE_NAME),
 			namespace: strng::new("internal"),
 			rule_name: None,
 			kind: None,
@@ -5009,6 +5043,7 @@ async fn convert_llm_config(
 			Some(tls) => ListenerProtocol::HTTPS(tls),
 			None => ListenerProtocol::HTTP,
 		},
+		..Default::default()
 	};
 
 	if !listener_gateway_policies.is_empty() || !listener_route_policies.is_empty() {
@@ -5132,6 +5167,7 @@ async fn convert_mcp_config(
 		name: listener_name,
 		hostname: strng::new("*"),
 		protocol: ListenerProtocol::HTTP,
+		..Default::default()
 	};
 
 	let mut listener_set = ListenerSet::default();
@@ -5320,6 +5356,7 @@ async fn convert_listener(
 		name,
 		hostname,
 		protocol,
+		..Default::default()
 	};
 	Ok((l, rs, trs, all_policies, all_backends))
 }
@@ -5342,6 +5379,35 @@ pub async fn convert_route(
 	let route_name = name.name.unwrap_or_else(|| strng::format!("route{}", idx));
 	let namespace = name.namespace.unwrap_or_else(|| strng::new("default"));
 	let key = strng::format!("{listener_key}/{namespace}/{route_name}");
+
+	let is_prefix = |p: Option<&crate::types::agent::PathRedirect>| {
+		matches!(p, Some(crate::types::agent::PathRedirect::Prefix(_)))
+	};
+	let uses_prefix_rewrite = policies.as_ref().is_some_and(|p| {
+		is_prefix(p.url_rewrite.as_ref().and_then(|r| r.path.as_ref()))
+			|| is_prefix(p.request_redirect.as_ref().and_then(|r| r.path.as_ref()))
+	}) || backends.iter().any(|b| {
+		is_prefix(
+			b.policies
+				.as_ref()
+				.and_then(|p| p.request_redirect.as_ref()?.path.as_ref()),
+		)
+	});
+	// Delegated routes apply the filter against the child route's match, which is not known here.
+	let delegates = backends
+		.iter()
+		.any(|b| matches!(b.backend, LocalBackend::RouteGroup(_)));
+	if uses_prefix_rewrite
+		&& !delegates
+		&& let Some(m) = matches
+			.iter()
+			.find(|m| !matches!(m.path, PathMatch::PathPrefix(_)))
+	{
+		bail!(
+			"route {route_name}: path prefix rewrite requires every match to be a path prefix match, got {:?}",
+			m.path
+		);
+	}
 
 	let mut backend_refs = Vec::new();
 	let mut external_backends = Vec::new();
@@ -5623,6 +5689,12 @@ pub(crate) async fn split_policies_for_target(
 
 	// Filters
 	if let Some(p) = direct_response {
+		match &p {
+			LocalExplicitOrConditional::Explicit(dr) => dr.validate()?,
+			LocalExplicitOrConditional::Conditional(c) => {
+				c.conditional.iter().try_for_each(|e| e.policy.validate())?
+			},
+		}
 		route_policies.push(TrafficPolicy::DirectResponse(p.into_policy()?));
 	}
 	if let Some(p) = cors {
@@ -5709,7 +5781,7 @@ pub(crate) async fn split_policies_for_target(
 	};
 	if let Some(p) = basic_auth {
 		route_policies.push(TrafficPolicy::BasicAuth(RequestPolicy::single(
-			p.try_into()?,
+			p.try_into(resources).await?,
 		)));
 	}
 	if let Some(p) = api_key {

@@ -28,7 +28,7 @@ def decode(data):
     return events[-1] if events else None
 
 
-def run_case(binary, stateful, version, call_first=False):
+def run_case(binary, stateful, version, call_first=False, public_name="echo"):
     modern = version == "2026-07-28"
     methods = []
     violations = []
@@ -76,6 +76,7 @@ def run_case(binary, stateful, version, call_first=False):
                     result = {"tools": [{"name": "echo", "description": "Echo input",
                                          "inputSchema": {"type": "object"}}]}
                 elif method == "tools/call":
+                    assert body["params"]["name"] == "echo", body
                     result = {"content": [{"type": "text", "text": "called once"}]}
                 else:
                     violations.append(f"unexpected method {method}")
@@ -96,6 +97,9 @@ def run_case(binary, stateful, version, call_first=False):
                   "statefulMode": "stateful" if stateful else "stateless", "lazyTools": True,
                   "targets": [{"name": "strict", "mcp": {"host": "127.0.0.1", "port": server.server_port, "path": "/mcp"}}]
               }}]}]}]}]}
+    if public_name != "echo":
+        mcp = config["binds"][0]["listeners"][0]["routes"][0]["backends"][0]["mcp"]
+        mcp.update(prefixMode="never", toolNameOverrides=[{"target": "strict", "source": "echo", "name": public_name}])
     process = None
     timings = {}
     try:
@@ -174,9 +178,9 @@ def run_case(binary, stateful, version, call_first=False):
                     assert max(timings.values()) < 500, timings
                     slow.clear()
                     if not call_first:
-                        result = request("tools/call", {"name": "mcp_search", "arguments": {"query": "echo"}})
-                        assert "echo" in json.dumps(result), result
-                    result = request("tools/call", {"name": "mcp_call", "arguments": {"name": "echo", "arguments": {}}})
+                        result = request("tools/call", {"name": "mcp_search", "arguments": {"query": public_name}})
+                        assert public_name in json.dumps(result), result
+                    result = request("tools/call", {"name": "mcp_call", "arguments": {"name": public_name, "arguments": {}}})
                     assert "called once" in json.dumps(result), result
                     # В stateless legacy каждый реальный HTTP-запрос имеет собственный handshake.
                     expected = (["server/discover", "tools/list", "server/discover", "tools/call"] if modern else

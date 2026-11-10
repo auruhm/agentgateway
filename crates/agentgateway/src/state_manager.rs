@@ -248,11 +248,11 @@ impl LocalClient {
 		let config_content = self.config_content().await?;
 		let resources =
 			crate::resource_manager::ResourceFetcher::managed(self.resource_manager.clone());
-		let config = crate::types::local::NormalizedLocalConfig::from(
+		let config = crate::types::local::NormalizedLocalConfig::from_expanded(
 			&self.config,
 			&resources,
 			self.gateway.clone(),
-			config_content.as_str(),
+			config_content,
 		)
 		.await?;
 		let model_catalog = config
@@ -302,7 +302,7 @@ impl LocalClient {
 		{
 			return config_store::materialize_hybrid_config(&self.cfg, store).await;
 		}
-		self.cfg.read_to_string().await
+		crate::types::local::expand_env(&self.cfg.read_to_string().await?)
 	}
 
 	async fn reload_config_after_change(&self, prev: PreviousState) -> PreviousState {
@@ -380,8 +380,7 @@ async fn watch_self_workload(
 	// allow a cluster id mismatch as a very common misconfiguration is that the control plane and
 	// dataplane mismatch on this but if we do hit a conflict (should be rare) we use the cluster_id
 	// as a tiebreaker
-	let lookup = || {
-		let store = stores.discovery.read();
+	let lookup = |store: &crate::store::DiscoveryStore| {
 		store
 			.workloads
 			.find_by_name(&name, &namespace)
@@ -391,7 +390,7 @@ async fn watch_self_workload(
 
 	{
 		let store = stores.discovery.read();
-		if let Some(w) = lookup() {
+		if let Some(w) = lookup(&store) {
 			store.self_workload.set((*w).clone());
 			store.rebucket_all();
 			return;
@@ -414,7 +413,7 @@ async fn watch_self_workload(
 	loop {
 		{
 			let store = stores.discovery.read();
-			if let Some(w) = lookup() {
+			if let Some(w) = lookup(&store) {
 				store.self_workload.set((*w).clone());
 				store.rebucket_all();
 				return;

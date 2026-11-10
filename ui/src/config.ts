@@ -41,7 +41,10 @@ export const mcpSettingsFields = [
 	'port',
 	'statefulMode',
 	'prefixMode',
-	'failureMode'
+	'failureMode',
+	'sseKeepAlive',
+	'dnsRebindingProtection',
+	'server'
 ] as const;
 
 export const providerNames: ProviderName[] = [
@@ -447,12 +450,12 @@ export function makeEmptyModel(): LlmModel {
 	} as unknown as LlmModel;
 }
 
-export function makeEmptyVirtualModel(): LlmVirtualModel {
+export function makeEmptyVirtualModel(model = ''): LlmVirtualModel {
 	return {
 		name: '',
 		routing: {
 			weighted: {
-				targets: [{ model: '', weight: 1 }]
+				targets: [{ model, weight: 1 }]
 			}
 		}
 	};

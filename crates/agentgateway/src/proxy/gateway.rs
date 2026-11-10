@@ -31,7 +31,8 @@ use crate::store::{BindEvent, BindListeners, FrontendPolices};
 use crate::telemetry::metrics::{AdmissionLabels, TCPLabels};
 use crate::transport::BufferLimit;
 use crate::transport::stream::{
-	ConnectHeaders, Extension, LoggingMode, Socket, TCPConnectionInfo, TLSConnectionInfo,
+	ConnectAuthority, ConnectHeaders, Extension, LoggingMode, Socket, TCPConnectionInfo,
+	TLSConnectionInfo,
 };
 use crate::types::agent::{
 	BindKey, BindProtocol, Listener, ListenerProtocol, TransportProtocol, TunnelProtocol,
@@ -743,12 +744,12 @@ impl Gateway {
 					crate::http::mark_sensitive_headers(&mut req, &inputs.cfg.sensitive_headers);
 					let connect_headers = req.headers().clone();
 					let authority = match req.uri().authority() {
-						Some(authority) => authority.as_str(),
+						Some(authority) => authority.clone(),
 						None => return Ok(ProxyError::InvalidRequest.into_response_with_grpc(false)),
 					};
 					let (target_address, bind) = {
 						let binds = inputs.stores.read_binds();
-						if let Ok(addr) = authority.parse::<SocketAddr>() {
+						if let Ok(addr) = authority.as_str().parse::<SocketAddr>() {
 							// CONNECT re-entry must not expose a bind scoped to a concrete address
 							// (for example, a loopback-only listener). Match only an unspecified-address
 							// bind for this port; otherwise fall back to the explicit internal wildcard
@@ -828,6 +829,7 @@ impl Gateway {
 							downstream.ext_mut().insert(policy);
 						}
 						downstream.ext_mut().insert(ConnectHeaders(connect_headers));
+						downstream.ext_mut().insert(ConnectAuthority(authority));
 						if let Some(buffer) = buffer {
 							downstream.ext_mut().insert(BufferLimit::new(buffer));
 						}
@@ -907,15 +909,12 @@ impl Gateway {
 		if let Some(ch) = stream.ext_mut().remove::<ConnectHeaders>() {
 			src.connect_headers = ch.0;
 		}
-		// A denied TLS destination only serves an HTTP denial; it must not call auth services.
-		let egress_denied = stream.ext::<EgressTlsMode>() == Some(&EgressTlsMode::InterceptDenied);
-		if !egress_denied
-			&& let Some(network_authorization) = policies.network_authorization.as_ref()
+		if let Some(network_authorization) = policies.network_authorization.as_ref()
 			&& let Err(e) = network_authorization.apply(&crate::cel::Executor::new_tcp(Some(&src), &dst))
 		{
 			anyhow::bail!("network authorization denied: {e}");
 		}
-		if !egress_denied && let Some(authz) = policies.network_ext_authz.as_ref() {
+		if let Some(authz) = policies.network_ext_authz.as_ref() {
 			authz
 				.check_network(
 					super::httpproxy::PolicyClient::new(inputs.clone()),
@@ -1194,7 +1193,7 @@ impl Gateway {
 			.read_binds()
 			.get_bind_listener(bind_name, &serving_listener.key)
 		{
-			Some(current) => current.as_ref() != serving_listener,
+			Some(current) => !current.serving_eq(serving_listener),
 			None => true,
 		}
 	}
@@ -1249,7 +1248,7 @@ impl Gateway {
 			.await?;
 			let best = listeners
 				.best_match_filtered(sni, |protocol| match egress_mode {
-					Some(EgressTlsMode::Intercept | EgressTlsMode::InterceptDenied) => {
+					Some(EgressTlsMode::Intercept) => {
 						matches!(protocol, ListenerProtocol::HTTPS(_))
 					},
 					Some(EgressTlsMode::Passthrough) => matches!(protocol, ListenerProtocol::TLS(None)),
@@ -1535,6 +1534,7 @@ impl Gateway {
 					},
 					hostname: Default::default(),
 					protocol: ListenerProtocol::HBONE,
+					..Default::default()
 				})
 			});
 

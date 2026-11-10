@@ -705,6 +705,7 @@ fn convert_route_type(proto_rt: i32, diagnostics: &mut Diagnostics) -> llm::Rout
 		Ok(ProtoRT::Realtime) => llm::RouteType::Realtime,
 		Ok(ProtoRT::Rerank) => llm::RouteType::Rerank,
 		Ok(ProtoRT::Decisions) => llm::RouteType::Decisions,
+		Ok(ProtoRT::SystemOne) => llm::RouteType::SystemOne,
 		Ok(ProtoRT::GenerateContent) => llm::RouteType::GenerateContent,
 		Ok(ProtoRT::GeminiCountTokens) => llm::RouteType::GeminiCountTokens,
 		Err(_) => {
@@ -930,19 +931,75 @@ fn convert_content_scopes(
 fn header_modifier_from_proto(
 	headers: &proto::agent::HeaderModifier,
 ) -> http::filters::HeaderModifier {
-	http::filters::HeaderModifier {
-		add: headers
-			.add
-			.iter()
-			.map(|h| (strng::new(&h.name), strng::new(&h.value)))
-			.collect(),
-		set: headers
-			.set
-			.iter()
-			.map(|h| (strng::new(&h.name), strng::new(&h.value)))
-			.collect(),
-		remove: headers.remove.iter().map(strng::new).collect(),
+	let mut modifier = http::filters::HeaderModifier::default();
+	let mut convert = || -> Result<(), ProtoError> {
+		for h in &headers.add {
+			modifier
+				.add
+				.push((h.name.as_str().try_into()?, h.value.as_str().try_into()?));
+		}
+		for h in &headers.set {
+			modifier
+				.set
+				.push((h.name.as_str().try_into()?, h.value.as_str().try_into()?));
+		}
+		for h in &headers.remove {
+			modifier.remove.push(h.as_str().try_into()?);
+		}
+		Ok(())
+	};
+	if let Err(e) = convert() {
+		modifier.invalid = Some(strng::new(e.to_string()));
 	}
+	modifier
+}
+
+fn request_redirect_from_proto(
+	rr: &proto::agent::RequestRedirect,
+) -> Result<http::filters::RequestRedirect, ProtoError> {
+	let port = default_as_none(rr.port)
+		.map(|p| {
+			u16::try_from(p)
+				.ok()
+				.and_then(NonZeroU16::new)
+				.ok_or_else(|| ProtoError::Generic(format!("invalid redirect port {p}")))
+		})
+		.transpose()?;
+	Ok(http::filters::RequestRedirect {
+		scheme: default_as_none(rr.scheme.as_str())
+			.map(Scheme::try_from)
+			.transpose()?,
+		authority: match (default_as_none(rr.host.as_str()), port) {
+			(Some(h), Some(p)) => Some(HostRedirect::Full(format!("{h}:{p}").try_into()?)),
+			(_, Some(p)) => Some(HostRedirect::Port(p)),
+			(Some(h), _) => Some(HostRedirect::Host(h.try_into()?)),
+			(None, None) => None,
+		},
+		path: match &rr.path {
+			Some(proto::agent::request_redirect::Path::Full(f)) => {
+				Some(PathRedirect::Full(strng::new(f)))
+			},
+			Some(proto::agent::request_redirect::Path::Prefix(f)) => {
+				Some(PathRedirect::Prefix(strng::new(f)))
+			},
+			None => None,
+		},
+		status: default_as_none(rr.status)
+			.map(|i| StatusCode::from_u16(i as u16))
+			.transpose()?,
+	})
+}
+
+fn request_mirrors_from_proto(
+	m: &proto::agent::RequestMirrors,
+) -> Vec<http::filters::RequestMirror> {
+	m.mirrors
+		.iter()
+		.map(|m| http::filters::RequestMirror {
+			backend: resolve_simple_reference(m.backend.as_ref()),
+			percentage: m.percentage / 100.0,
+		})
+		.collect()
 }
 
 fn convert_backend_ai_policy(
@@ -1341,9 +1398,8 @@ fn backend_auth_kind_from_proto(
 			} else {
 				Some(a.region.clone())
 			};
-			let assume_role = a
-				.assume_role
-				.map(|assume_role| -> Result<_, ProtoError> {
+			let assume_role = match a.assume_role {
+				Some(assume_role) => {
 					let tags = assume_role
 						.tags
 						.into_iter()
@@ -1407,15 +1463,28 @@ fn backend_auth_kind_from_proto(
 							.map_err(|e| ProtoError::Generic(format!("assumeRole externalId: {e}")))?;
 						Some(assume_role.external_id)
 					};
-					Ok(auth::AwsAssumeRole {
+					let tags = match auth::aws::AwsSessionTags::try_new(tags) {
+						Ok(tags) => tags,
+						Err(error) => {
+							let reason = error.to_string();
+							diagnostics.add_warning(format!(
+								"AWS session tags are invalid; requests using this policy will be rejected: {reason}"
+							));
+							return Ok(Some(BackendAuthKind::Invalid {
+								kind: "aws",
+								reason,
+							}));
+						},
+					};
+					Some(auth::AwsAssumeRole {
 						role_arn: assume_role.role_arn,
 						session_name,
-						tags: auth::aws::AwsSessionTags::try_new(tags)
-							.map_err(|e| ProtoError::Generic(e.to_string()))?,
+						tags,
 						external_id,
 					})
-				})
-				.transpose()?;
+				},
+				None => None,
+			};
 			let aws_auth = match a.kind {
 				Some(proto::agent::aws::Kind::ExplicitConfig(config)) => {
 					if assume_role.is_some() {
@@ -1631,6 +1700,12 @@ impl Listener {
 				.into(),
 			hostname: s.hostname.clone().into(),
 			protocol,
+			inline_policies: s
+				.traffic_policies
+				.iter()
+				.map(|policy| traffic_policy_from_proto(policy, diagnostics))
+				.collect::<Result<Vec<_>, _>>()?,
+			error: s.error.as_deref().map(strng::new),
 		};
 		Ok((l, strng::new(&s.bind_key)))
 	}
@@ -1771,30 +1846,15 @@ impl ModelRoute {
 				};
 				ModelRouteKind::Concrete(llm::model_router::ModelRoute {
 					discovery: concrete.discovery_provider.as_ref().and_then(|provider| {
-						if !name.contains('*')
-							|| llm_policy
-								.overrides
+						llm::discovery::ModelDiscovery::new(
+							strng::new(provider),
+							None,
+							llm_policy
+								.transformations
 								.as_ref()
-								.is_some_and(|p| p.contains_key("model"))
-							|| llm_policy
-								.final_transformations
-								.as_ref()
-								.is_some_and(|p| p.contains_key("model"))
-						{
-							return None;
-						}
-						let transformation = match llm_policy
-							.transformations
-							.as_ref()
-							.and_then(|p| p.get("model"))
-						{
-							Some(expression) => llm::model_transform::reverse_model_transformation(expression)?,
-							None => llm::model_transform::ModelTransformation::Identity,
-						};
-						Some(llm::discovery::ModelDiscovery {
-							provider: strng::new(provider),
-							transformation,
-						})
+								.and_then(|p| p.get("model"))
+								.map(AsRef::as_ref),
+						)
 					}),
 					id: None,
 					name: model_match.model.clone(),
@@ -2101,6 +2161,11 @@ pub(crate) fn backend_with_policies_from_proto(
 							AIProvider::OpenAI(llm::openai::Provider {
 								model_override: openai.model.as_deref().map(strng::new),
 								moderation,
+							})
+						},
+						Some(provider::Provider::Copilot(copilot)) => {
+							AIProvider::Copilot(llm::copilot::Provider {
+								model_override: copilot.model.as_deref().map(strng::new),
 							})
 						},
 						Some(provider::Provider::Gemini(gemini)) => AIProvider::Gemini(llm::gemini::Provider {
@@ -2616,70 +2681,17 @@ fn backend_policy_from_proto(
 			BackendTrafficPolicy::Transformation(Arc::new(transformation_from_proto(tp, diagnostics)?))
 		},
 		Some(bps::Kind::RequestHeaderModifier(rhm)) => {
-			BackendTrafficPolicy::RequestHeaderModifier(http::filters::HeaderModifier {
-				add: rhm
-					.add
-					.iter()
-					.map(|h| (strng::new(&h.name), strng::new(&h.value)))
-					.collect(),
-				set: rhm
-					.set
-					.iter()
-					.map(|h| (strng::new(&h.name), strng::new(&h.value)))
-					.collect(),
-				remove: rhm.remove.iter().map(strng::new).collect(),
-			})
+			BackendTrafficPolicy::RequestHeaderModifier(header_modifier_from_proto(rhm))
 		},
 		Some(bps::Kind::ResponseHeaderModifier(rhm)) => {
-			BackendTrafficPolicy::ResponseHeaderModifier(Arc::new(http::filters::HeaderModifier {
-				add: rhm
-					.add
-					.iter()
-					.map(|h| (strng::new(&h.name), strng::new(&h.value)))
-					.collect(),
-				set: rhm
-					.set
-					.iter()
-					.map(|h| (strng::new(&h.name), strng::new(&h.value)))
-					.collect(),
-				remove: rhm.remove.iter().map(strng::new).collect(),
-			}))
+			BackendTrafficPolicy::ResponseHeaderModifier(Arc::new(header_modifier_from_proto(rhm)))
 		},
 		Some(bps::Kind::RequestRedirect(rr)) => {
-			BackendTrafficPolicy::RequestRedirect(http::filters::RequestRedirect {
-				scheme: default_as_none(rr.scheme.as_str())
-					.map(Scheme::try_from)
-					.transpose()?,
-				authority: match (default_as_none(rr.host.as_str()), default_as_none(rr.port)) {
-					(Some(h), Some(p)) => Some(HostRedirect::Full(strng::format!("{h}:{p}"))),
-					(_, Some(p)) => Some(HostRedirect::Port(NonZeroU16::new(p as u16).unwrap())),
-					(Some(h), _) => Some(HostRedirect::Host(strng::new(h))),
-					(None, None) => None,
-				},
-				path: match &rr.path {
-					Some(proto::agent::request_redirect::Path::Full(f)) => {
-						Some(PathRedirect::Full(strng::new(f)))
-					},
-					Some(proto::agent::request_redirect::Path::Prefix(f)) => {
-						Some(PathRedirect::Prefix(strng::new(f)))
-					},
-					None => None,
-				},
-				status: default_as_none(rr.status)
-					.map(|i| StatusCode::from_u16(i as u16))
-					.transpose()?,
-			})
+			BackendTrafficPolicy::RequestRedirect(request_redirect_from_proto(rr)?)
 		},
-		Some(bps::Kind::UrlRewrite(ur)) => BackendTrafficPolicy::UrlRewrite(ur.into()),
+		Some(bps::Kind::UrlRewrite(ur)) => BackendTrafficPolicy::UrlRewrite(ur.try_into()?),
 		Some(bps::Kind::RequestMirror(m)) => {
-			let mirrors = m
-				.mirrors
-				.iter()
-				.map(|m| http::filters::RequestMirror {
-					backend: resolve_simple_reference(m.backend.as_ref()),
-					percentage: m.percentage / 100.0,
-				})
-				.collect::<Vec<_>>();
+			let mirrors = request_mirrors_from_proto(m);
 			BackendTrafficPolicy::RequestMirror(mirrors)
 		},
 		Some(bps::Kind::Health(h)) => BackendTrafficPolicy::Health(convert_health(h, diagnostics)),
@@ -2746,8 +2758,7 @@ fn traffic_policy_from_proto(
 				.transpose()?,
 		}),
 		Some(tps::Kind::Retry(r)) => {
-			let attempts = std::num::NonZeroU8::new(r.attempts as u8)
-				.unwrap_or_else(|| std::num::NonZeroU8::new(1).unwrap());
+			let attempts = r.attempts.map(|a| a.clamp(0, 255) as u8).unwrap_or(1);
 			let backoff = r.backoff.as_ref().map(|d| (*d).try_into()).transpose()?;
 			let codes = r
 				.retry_status_codes
@@ -3094,74 +3105,23 @@ fn traffic_policy_from_proto(
 			}))
 		},
 		Some(tps::Kind::RequestHeaderModifier(rhm)) => {
-			TrafficPolicy::RequestHeaderModifier(RequestPolicy::single(http::filters::HeaderModifier {
-				add: rhm
-					.add
-					.iter()
-					.map(|h| (strng::new(&h.name), strng::new(&h.value)))
-					.collect(),
-				set: rhm
-					.set
-					.iter()
-					.map(|h| (strng::new(&h.name), strng::new(&h.value)))
-					.collect(),
-				remove: rhm.remove.iter().map(strng::new).collect(),
-			}))
+			TrafficPolicy::RequestHeaderModifier(RequestPolicy::single(header_modifier_from_proto(rhm)))
 		},
 		Some(tps::Kind::ResponseHeaderModifier(rhm)) => {
-			TrafficPolicy::ResponseHeaderModifier(RequestPolicy::single(http::filters::HeaderModifier {
-				add: rhm
-					.add
-					.iter()
-					.map(|h| (strng::new(&h.name), strng::new(&h.value)))
-					.collect(),
-				set: rhm
-					.set
-					.iter()
-					.map(|h| (strng::new(&h.name), strng::new(&h.value)))
-					.collect(),
-				remove: rhm.remove.iter().map(strng::new).collect(),
-			}))
+			TrafficPolicy::ResponseHeaderModifier(RequestPolicy::single(header_modifier_from_proto(rhm)))
 		},
 		Some(tps::Kind::RequestRedirect(rr)) => {
-			TrafficPolicy::RequestRedirect(RequestPolicy::single(http::filters::RequestRedirect {
-				scheme: default_as_none(rr.scheme.as_str())
-					.map(Scheme::try_from)
-					.transpose()?,
-				authority: match (default_as_none(rr.host.as_str()), default_as_none(rr.port)) {
-					(Some(h), Some(p)) => Some(HostRedirect::Full(strng::format!("{h}:{p}"))),
-					(_, Some(p)) => Some(HostRedirect::Port(NonZeroU16::new(p as u16).unwrap())),
-					(Some(h), _) => Some(HostRedirect::Host(strng::new(h))),
-					(None, None) => None,
-				},
-				path: match &rr.path {
-					Some(proto::agent::request_redirect::Path::Full(f)) => {
-						Some(PathRedirect::Full(strng::new(f)))
-					},
-					Some(proto::agent::request_redirect::Path::Prefix(f)) => {
-						Some(PathRedirect::Prefix(strng::new(f)))
-					},
-					None => None,
-				},
-				status: default_as_none(rr.status)
-					.map(|i| StatusCode::from_u16(i as u16))
-					.transpose()?,
-			}))
+			TrafficPolicy::RequestRedirect(RequestPolicy::single(request_redirect_from_proto(rr)?))
 		},
-		Some(tps::Kind::UrlRewrite(ur)) => TrafficPolicy::UrlRewrite(RequestPolicy::single(ur.into())),
+		Some(tps::Kind::UrlRewrite(ur)) => {
+			TrafficPolicy::UrlRewrite(RequestPolicy::single(ur.try_into()?))
+		},
 		Some(tps::Kind::RequestMirror(m)) => {
-			let mirrors = m
-				.mirrors
-				.iter()
-				.map(|m| http::filters::RequestMirror {
-					backend: resolve_simple_reference(m.backend.as_ref()),
-					percentage: m.percentage / 100.0,
-				})
-				.collect::<Vec<_>>();
+			let mirrors = request_mirrors_from_proto(m);
 			TrafficPolicy::RequestMirror(mirrors)
 		},
 		Some(tps::Kind::DirectResponse(dr)) => {
-			TrafficPolicy::DirectResponse(RequestPolicy::single(http::filters::DirectResponse {
+			let dr = http::filters::DirectResponse {
 				body: bytes::Bytes::copy_from_slice(&dr.body),
 				body_expression: (!dr.body_expression.is_empty()).then(|| {
 					Arc::new(permissive_cel_expression(
@@ -3185,7 +3145,10 @@ fn traffic_policy_from_proto(
 					})
 					.collect::<Result<_, ProtoError>>()?,
 				status: StatusCode::from_u16(dr.status as u16)?,
-			}))
+			};
+			dr.validate()
+				.map_err(|e| ProtoError::Generic(e.to_string()))?;
+			TrafficPolicy::DirectResponse(RequestPolicy::single(dr))
 		},
 		Some(tps::Kind::Cors(c)) => TrafficPolicy::CORS(RequestPolicy::single(
 			http::cors::Cors::try_from(http::cors::CorsSerde {
@@ -3431,7 +3394,7 @@ fn external_auth_from_proto(
 		};
 	let cache_store = cache
 		.as_ref()
-		.map(|cache| crate::http::ext_authz::cache_store(cache.max_entries))
+		.map(|cache| crate::http::expiring_cache::ExpiringCache::new(cache.max_entries))
 		.unwrap_or_else(crate::http::ext_authz::default_cache_store);
 	let policies = backend_policies_from_proto(&ea.inline_policies, diagnostics)?;
 	Ok(http::ext_authz::ExtAuthz {
@@ -3919,10 +3882,13 @@ impl From<&proto::agent::KeepaliveConfig> for KeepaliveConfig {
 	}
 }
 
-impl From<&proto::agent::UrlRewrite> for http::filters::UrlRewrite {
-	fn from(ur: &proto::agent::UrlRewrite) -> Self {
-		http::filters::UrlRewrite {
-			authority: default_as_none(ur.host.as_str()).map(|h| HostRedirect::Host(strng::new(h))),
+impl TryFrom<&proto::agent::UrlRewrite> for http::filters::UrlRewrite {
+	type Error = ProtoError;
+	fn try_from(ur: &proto::agent::UrlRewrite) -> Result<Self, Self::Error> {
+		Ok(http::filters::UrlRewrite {
+			authority: default_as_none(ur.host.as_str())
+				.map(|h| h.try_into().map(HostRedirect::Host))
+				.transpose()?,
 			path: match &ur.path {
 				Some(proto::agent::url_rewrite::Path::Full(f)) => Some(PathRedirect::Full(strng::new(f))),
 				Some(proto::agent::url_rewrite::Path::Prefix(p)) => {
@@ -3930,7 +3896,7 @@ impl From<&proto::agent::UrlRewrite> for http::filters::UrlRewrite {
 				},
 				None => None,
 			},
-		}
+		})
 	}
 }
 
@@ -4555,12 +4521,11 @@ mod tests {
 		.unwrap_err();
 		convert_content_scopes(&[42], llm::policy::default_content_scope).unwrap_err();
 
-		// TODO respect scopes in all guard types
 		let ai = Ai {
 			prompt_guard: Some(proto::agent::backend_policy_spec::ai::PromptGuard {
 				request: vec![proto::agent::backend_policy_spec::ai::RequestGuard {
 					rejection: None,
-					kind: Some(Kind::OpenaiModeration(Default::default())),
+					kind: Some(Kind::Webhook(Default::default())),
 					scope: vec![ProtoScope::ToolInput as i32],
 				}],
 				..Default::default()
@@ -4568,7 +4533,7 @@ mod tests {
 			..Default::default()
 		};
 		let err = convert_backend_ai_policy(&ai, &mut Diagnostics::default()).unwrap_err();
-		assert!(err.to_string().contains("non-default scope"), "{err}");
+		assert!(err.to_string().contains("do not support scope"), "{err}");
 
 		// response guards: regex can opt in to tool calls, webhook cannot
 		let convert_response_guard = |kind, scope| {
@@ -4636,9 +4601,9 @@ mod tests {
 		let rejection = &policy.prompt_guard.unwrap().response[0].rejection;
 		let headers = rejection.headers.as_ref().unwrap();
 		assert_eq!(headers.set[0].0.as_str(), "content-type");
-		assert_eq!(headers.set[0].1.as_str(), "application/json");
+		assert_eq!(headers.set[0].1, "application/json");
 		assert_eq!(headers.add[0].0.as_str(), "x-guardrail");
-		assert_eq!(headers.add[0].1.as_str(), "regex");
+		assert_eq!(headers.add[0].1, "regex");
 		assert_eq!(headers.remove[0].as_str(), "server");
 
 		let response = rejection.as_response();
@@ -5713,6 +5678,60 @@ mod tests {
 		assert_eq!(service_name.as_deref(), Some("bedrock-agentcore"));
 		assert_eq!(region.as_deref(), Some("us-east-1"));
 		Ok(())
+	}
+
+	#[test]
+	fn aws_session_tag_validation_warns_and_fails_closed() {
+		for (key, value, invalid) in [
+			("cost-center", "cc#42", true),
+			("cost-center", "R&D", true),
+			("cost-center", "Team (Payments)", true),
+			("cost-center", "a,b", true),
+			("cost#center", "payments", true),
+			("cost-center", "payments", false),
+			("cost-center", "", false),
+			("équipe", "研发 Payments_1.:/=+-@", false),
+		] {
+			let mut diagnostics = Diagnostics::default();
+			let auth = backend_auth_kind_from_proto(
+				proto::agent::BackendAuthPolicy {
+					kind: Some(proto::agent::backend_auth_policy::Kind::Aws(
+						proto::agent::Aws {
+							kind: Some(proto::agent::aws::Kind::Implicit(
+								proto::agent::AwsImplicit {},
+							)),
+							assume_role: Some(proto::agent::AwsAssumeRole {
+								role_arn: "arn:aws:iam::123456789012:role/backend".to_string(),
+								tags: vec![proto::agent::AwsSessionTag {
+									key: key.to_string(),
+									value: value.to_string(),
+									..Default::default()
+								}],
+								..Default::default()
+							}),
+							..Default::default()
+						},
+					)),
+					..Default::default()
+				},
+				&mut diagnostics,
+			)
+			.expect("invalid tags should not reject the resource")
+			.expect("AWS auth must be retained");
+			let warnings = diagnostics.into_warnings();
+			if invalid {
+				let BackendAuthKind::Invalid { kind, reason } = auth else {
+					panic!("invalid tags must reject requests");
+				};
+				assert_eq!(kind, "aws");
+				assert!(reason.contains("contains characters STS does not accept"));
+				assert_eq!(warnings.len(), 1);
+				assert!(warnings[0].contains(&reason));
+			} else {
+				assert!(matches!(auth, BackendAuthKind::Aws(_)));
+				assert!(warnings.is_empty());
+			}
+		}
 	}
 
 	#[test]

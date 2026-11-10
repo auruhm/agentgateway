@@ -64,7 +64,7 @@ impl Bind {
 	}
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct BindSnapshot {
 	#[cfg_attr(feature = "schema", schemars(flatten))]
@@ -114,7 +114,7 @@ impl std::ops::DerefMut for BindSnapshot {
 pub type BindKey = Strng;
 
 #[apply(schema_ser_schema!)]
-#[derive(Eq, PartialEq)]
+#[derive(Default)]
 pub struct Listener {
 	pub key: ListenerKey,
 	// User facing name
@@ -124,9 +124,26 @@ pub struct Listener {
 	/// Can be a wildcard
 	pub hostname: Strng,
 	pub protocol: ListenerProtocol,
+	/// Gateway phase traffic policies applied to all requests on the listener.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[cfg_attr(feature = "schema", schemars(with = "Vec<serde_json::Value>"))]
+	pub inline_policies: Vec<TrafficPolicy>,
+	/// If set, the listener's configuration is invalid, and every request on it fails.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub error: Option<Strng>,
 }
 
 impl Listener {
+	/// Reports whether the parts of the listener that affect how it is served are equal.
+	/// Inline policies and the error are excluded: they are resolved per request, so changing them
+	/// must not restart the serving listener.
+	pub fn serving_eq(&self, other: &Self) -> bool {
+		self.key == other.key
+			&& self.name == other.name
+			&& self.hostname == other.hostname
+			&& self.protocol == other.protocol
+	}
+
 	pub fn matches(&self, hostname: &str) -> bool {
 		self.hostname == hostname
 			|| self.hostname.is_empty()
@@ -697,10 +714,11 @@ pub fn parse_key(key: &[u8]) -> Result<PrivateKeyDer<'static>, anyhow::Error> {
 	}
 	parsed.ok_or_else(|| anyhow!("no key"))
 }
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Default, Eq, PartialEq, serde::Serialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 pub enum ListenerProtocol {
 	/// HTTP
+	#[default]
 	HTTP,
 	/// HTTPS, terminating TLS then treating as HTTP
 	HTTPS(ServerTLSConfig),
@@ -1296,9 +1314,17 @@ mod serde_path_regex {
 #[derive(Eq, PartialEq)]
 pub enum HostRedirect {
 	/// Replace the full authority, including host and optional port.
-	Full(Strng),
+	Full(
+		#[serde(serialize_with = "ser_display", deserialize_with = "de_parse")]
+		#[cfg_attr(feature = "schema", schemars(with = "String"))]
+		::http::uri::Authority,
+	),
 	/// Replace only the host and preserve the effective port.
-	Host(Strng),
+	Host(
+		#[serde(serialize_with = "ser_display", deserialize_with = "de_parse")]
+		#[cfg_attr(feature = "schema", schemars(with = "String"))]
+		::http::uri::Authority,
+	),
 	/// Replace only the port.
 	Port(NonZeroU16),
 	/// Use the selected backend host when possible.
@@ -1320,9 +1346,20 @@ pub enum HostRedirectOverride {
 #[derive(Eq, PartialEq)]
 pub enum PathRedirect {
 	/// Replace the full request path.
-	Full(Strng),
+	Full(#[serde(deserialize_with = "de_redirect_path")] Strng),
 	/// Replace only the matched path prefix.
-	Prefix(Strng),
+	Prefix(#[serde(deserialize_with = "de_redirect_path")] Strng),
+}
+
+fn de_redirect_path<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Strng, D::Error> {
+	let path = <std::borrow::Cow<'de, str> as serde::Deserialize>::deserialize(d)?;
+	if !path.is_empty() && !path.starts_with('/') {
+		return Err(serde::de::Error::custom(format!(
+			"path {path:?} must start with '/'"
+		)));
+	}
+	::http::uri::PathAndQuery::try_from(path.as_ref()).map_err(serde::de::Error::custom)?;
+	Ok(strng::new(path))
 }
 
 #[apply(schema_ser_schema!)]
@@ -2098,9 +2135,11 @@ pub struct OpenAPITarget {
 	#[serde(skip_serializing)]
 	#[cfg_attr(feature = "schema", schemars(with = "serde_json::value::RawValue"))]
 	pub schema: Arc<OpenAPI>,
+	/// Path prepended to each operation path.
+	pub prefix: String,
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[cfg_attr(
 	feature = "schema",
@@ -2695,8 +2734,10 @@ where
 #[serde(rename_all = "lowercase", deny_unknown_fields)]
 #[cfg_attr(feature = "schema", derive(crate::JsonSchema))]
 pub enum TracingProtocol {
+	/// Export over OTLP/gRPC.
 	#[default]
 	Grpc,
+	/// Export over OTLP/HTTP.
 	Http,
 }
 
@@ -3343,6 +3384,10 @@ impl TryFrom<&str> for Target {
 		if let Some(path) = hostport.strip_prefix("unix:") {
 			return Ok(Target::UnixSocket(PathBuf::from(path)));
 		}
+		// Handles bracketed IPv6 (e.g. [::1]:80), which a plain split on ':' cannot.
+		if let Ok(addr) = hostport.parse::<SocketAddr>() {
+			return Ok(Target::Address(addr));
+		}
 		let Some((host, port)) = hostport.split_once(":") else {
 			anyhow::bail!("invalid host:port: {hostport}");
 		};
@@ -3752,6 +3797,15 @@ InvalidKeyData
 		// Ensure hostname:port still works
 		let target = Target::try_from("example.com:443").unwrap();
 		assert!(matches!(target, Target::Hostname(h, 443) if h.as_str() == "example.com"));
+	}
+
+	#[test]
+	fn test_target_ipv6_roundtrip() {
+		let target = Target::try_from("[::1]:8080").unwrap();
+		assert!(matches!(target, Target::Address(addr) if addr.to_string() == "[::1]:8080"));
+		let json = serde_json::to_value(&target).unwrap();
+		let target: Target = serde_json::from_value(json).unwrap();
+		assert_eq!(target.to_string(), "[::1]:8080");
 	}
 
 	#[test]
@@ -4184,6 +4238,7 @@ jwtValidationOptions:
 			name: ListenerName::default(),
 			hostname: strng::new(hostname),
 			protocol,
+			..Default::default()
 		}
 	}
 

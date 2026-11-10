@@ -253,6 +253,17 @@ spec:
                                   rule: '!has(self.guardrail) || !has(self.endpointPreference)
                                     || !(self.endpointPreference in [''MantlePreferred'',
                                     ''MantleOnly''])'
+                              copilot:
+                                description: GitHub Copilot provider settings.
+                                properties:
+                                  model:
+                                    description: |-
+                                      Model name override.
+                                      If unset, the model name is taken from the request.
+                                    maxLength: 256
+                                    minLength: 1
+                                    type: string
+                                type: object
                               custom:
                                 description: |-
                                   Custom provider configures a non-managed or self-hosted LLM provider.
@@ -676,10 +687,11 @@ spec:
                                         type: object
                                       promptCaching:
                                         description: |-
-                                          Automatic prompt caching for supported
-                                          providers, currently AWS Bedrock.
+                                          Automatic prompt caching for supported providers: Anthropic, Anthropic
+                                          models on Vertex AI, and AWS Bedrock (Claude 3+ and Nova models).
                                           Reduces API costs by caching static content like system prompts and tool definitions.
-                                          Only applicable for Bedrock Claude 3+ and Nova models.
+                                          Cache marks sent by the client take precedence: if a request already has any,
+                                          the policy adds none.
                                         properties:
                                           cacheMessageOffset:
                                             description: |-
@@ -703,12 +715,14 @@ spec:
                                             description: |-
                                               Enables caching for tool definitions. Defaults to false.
                                               Inserts a cache point after all tool specifications.
+                                              Ignored for Bedrock Nova models, which do not support caching tools.
                                             type: boolean
                                           minTokens:
                                             description: |-
                                               Minimum estimated token count
                                               before caching is enabled. Uses rough heuristic (word count × 1.3) to estimate tokens.
-                                              Defaults to 1024. Bedrock requires at least 1,024 tokens for caching to be effective.
+                                              Applies to system prompt caching. Defaults to 1024; most models require at least
+                                              1,024 tokens for caching to be effective.
                                             minimum: 0
                                             type: integer
                                         type: object
@@ -2702,8 +2716,9 @@ spec:
                                                 scope:
                                                   description: |-
                                                     Which parts of the request this guard inspects. When unset, defaults to
-                                                    `SystemPrompt` and `Messages`. Tool call inputs and outputs are not
-                                                    inspected unless `ToolInput`/`ToolOutput` are listed explicitly.
+                                                    `SystemPrompt`, `Messages`, and `ToolOutput`. Tool call inputs are not
+                                                    inspected unless `ToolInput` is listed explicitly. Webhook guards do not
+                                                    support scope and always inspect `SystemPrompt` and `Messages`.
                                                     In APIs that send tool arguments as opaque JSON, such as Completions, the
                                                     arguments are masked as a single string, meaning a prompt guard has the
                                                     potential to rewrite the arguments into invalid JSON.
@@ -2866,13 +2881,11 @@ spec:
                                                   type: object
                                               type: object
                                               x-kubernetes-validations:
-                                              - message: 'scope: only regex and bedrockGuardrails
-                                                  guards support a non-default scope;
-                                                  other guard kinds always inspect
-                                                  the default (SystemPrompt + Messages)'
-                                                rule: '!has(self.scope) || has(self.regex)
-                                                  || has(self.bedrockGuardrails) ||
-                                                  (self.scope.size() == 2 && ''SystemPrompt''
+                                              - message: 'scope: webhook guards do
+                                                  not support scope; they always inspect
+                                                  SystemPrompt + Messages'
+                                                rule: '!has(self.scope) || !has(self.webhook)
+                                                  || (self.scope.size() == 2 && ''SystemPrompt''
                                                   in self.scope && ''Messages'' in
                                                   self.scope)'
                                               - message: exactly one of the fields
@@ -4471,13 +4484,12 @@ spec:
                                                   type: object
                                               type: object
                                               x-kubernetes-validations:
-                                              - message: 'scope: only regex and bedrockGuardrails
-                                                  guards support a non-default scope;
-                                                  other guard kinds always inspect
-                                                  the default (Messages)'
-                                                rule: '!has(self.scope) || has(self.regex)
-                                                  || has(self.bedrockGuardrails) ||
-                                                  (self.scope.size() == 1 && ''Messages''
+                                              - message: 'scope: webhook guards do
+                                                  not support a non-default scope;
+                                                  they always inspect the default
+                                                  (Messages)'
+                                                rule: '!has(self.scope) || !has(self.webhook)
+                                                  || (self.scope.size() == 1 && ''Messages''
                                                   in self.scope)'
                                               - message: exactly one of the fields
                                                   in [regex webhook bedrockGuardrails
@@ -4525,6 +4537,7 @@ spec:
                                           - Realtime
                                           - Rerank
                                           - Responses
+                                          - SystemOne
                                           type: string
                                         description: |-
                                           Rules for identifying the type of traffic to handle.
@@ -7313,9 +7326,9 @@ spec:
                             - message: pathPrefix requires host to be set
                               rule: 'has(self.pathPrefix) ? has(self.host) : true'
                             - message: exactly one of the fields in [openai azureopenai
-                                azure anthropic gemini vertexai bedrock custom] must
-                                be set
-                              rule: (has(self.openai)?1:0)+(has(self.azureopenai)?1:0)+(has(self.azure)?1:0)+(has(self.anthropic)?1:0)+(has(self.gemini)?1:0)+(has(self.vertexai)?1:0)+(has(self.bedrock)?1:0)+(has(self.custom)?1:0)
+                                azure anthropic gemini vertexai bedrock custom copilot]
+                                must be set
+                              rule: (has(self.openai)?1:0)+(has(self.azureopenai)?1:0)+(has(self.azure)?1:0)+(has(self.anthropic)?1:0)+(has(self.gemini)?1:0)+(has(self.vertexai)?1:0)+(has(self.bedrock)?1:0)+(has(self.custom)?1:0)+(has(self.copilot)?1:0)
                                 == 1
                           maxItems: 16
                           minItems: 1
@@ -7490,6 +7503,17 @@ spec:
                           rule: '!has(self.guardrail) || !has(self.endpointPreference)
                             || !(self.endpointPreference in [''MantlePreferred'',
                             ''MantleOnly''])'
+                      copilot:
+                        description: GitHub Copilot provider settings.
+                        properties:
+                          model:
+                            description: |-
+                              Model name override.
+                              If unset, the model name is taken from the request.
+                            maxLength: 256
+                            minLength: 1
+                            type: string
+                        type: object
                       custom:
                         description: |-
                           Custom provider configures a non-managed or self-hosted LLM provider.
@@ -7747,8 +7771,9 @@ spec:
                     - message: pathPrefix requires host to be set
                       rule: 'has(self.pathPrefix) ? has(self.host) : true'
                     - message: exactly one of the fields in [openai azureopenai azure
-                        anthropic gemini vertexai bedrock custom] must be set
-                      rule: (has(self.openai)?1:0)+(has(self.azureopenai)?1:0)+(has(self.azure)?1:0)+(has(self.anthropic)?1:0)+(has(self.gemini)?1:0)+(has(self.vertexai)?1:0)+(has(self.bedrock)?1:0)+(has(self.custom)?1:0)
+                        anthropic gemini vertexai bedrock custom copilot] must be
+                        set
+                      rule: (has(self.openai)?1:0)+(has(self.azureopenai)?1:0)+(has(self.azure)?1:0)+(has(self.anthropic)?1:0)+(has(self.gemini)?1:0)+(has(self.vertexai)?1:0)+(has(self.bedrock)?1:0)+(has(self.custom)?1:0)+(has(self.copilot)?1:0)
                         == 1
                 type: object
                 x-kubernetes-validations:
@@ -10476,10 +10501,11 @@ spec:
                         type: object
                       promptCaching:
                         description: |-
-                          Automatic prompt caching for supported
-                          providers, currently AWS Bedrock.
+                          Automatic prompt caching for supported providers: Anthropic, Anthropic
+                          models on Vertex AI, and AWS Bedrock (Claude 3+ and Nova models).
                           Reduces API costs by caching static content like system prompts and tool definitions.
-                          Only applicable for Bedrock Claude 3+ and Nova models.
+                          Cache marks sent by the client take precedence: if a request already has any,
+                          the policy adds none.
                         properties:
                           cacheMessageOffset:
                             description: |-
@@ -10503,12 +10529,14 @@ spec:
                             description: |-
                               Enables caching for tool definitions. Defaults to false.
                               Inserts a cache point after all tool specifications.
+                              Ignored for Bedrock Nova models, which do not support caching tools.
                             type: boolean
                           minTokens:
                             description: |-
                               Minimum estimated token count
                               before caching is enabled. Uses rough heuristic (word count × 1.3) to estimate tokens.
-                              Defaults to 1024. Bedrock requires at least 1,024 tokens for caching to be effective.
+                              Applies to system prompt caching. Defaults to 1024; most models require at least
+                              1,024 tokens for caching to be effective.
                             minimum: 0
                             type: integer
                         type: object
@@ -12235,8 +12263,9 @@ spec:
                                 scope:
                                   description: |-
                                     Which parts of the request this guard inspects. When unset, defaults to
-                                    `SystemPrompt` and `Messages`. Tool call inputs and outputs are not
-                                    inspected unless `ToolInput`/`ToolOutput` are listed explicitly.
+                                    `SystemPrompt`, `Messages`, and `ToolOutput`. Tool call inputs are not
+                                    inspected unless `ToolInput` is listed explicitly. Webhook guards do not
+                                    support scope and always inspect `SystemPrompt` and `Messages`.
                                     In APIs that send tool arguments as opaque JSON, such as Completions, the
                                     arguments are masked as a single string, meaning a prompt guard has the
                                     potential to rewrite the arguments into invalid JSON.
@@ -12384,13 +12413,11 @@ spec:
                                   type: object
                               type: object
                               x-kubernetes-validations:
-                              - message: 'scope: only regex and bedrockGuardrails
-                                  guards support a non-default scope; other guard
-                                  kinds always inspect the default (SystemPrompt +
-                                  Messages)'
-                                rule: '!has(self.scope) || has(self.regex) || has(self.bedrockGuardrails)
-                                  || (self.scope.size() == 2 && ''SystemPrompt'' in
-                                  self.scope && ''Messages'' in self.scope)'
+                              - message: 'scope: webhook guards do not support scope;
+                                  they always inspect SystemPrompt + Messages'
+                                rule: '!has(self.scope) || !has(self.webhook) || (self.scope.size()
+                                  == 2 && ''SystemPrompt'' in self.scope && ''Messages''
+                                  in self.scope)'
                               - message: exactly one of the fields in [regex webhook
                                   openAIModeration bedrockGuardrails googleModelArmor]
                                   must be set
@@ -13779,11 +13806,10 @@ spec:
                                   type: object
                               type: object
                               x-kubernetes-validations:
-                              - message: 'scope: only regex and bedrockGuardrails
-                                  guards support a non-default scope; other guard
-                                  kinds always inspect the default (Messages)'
-                                rule: '!has(self.scope) || has(self.regex) || has(self.bedrockGuardrails)
-                                  || (self.scope.size() == 1 && ''Messages'' in self.scope)'
+                              - message: 'scope: webhook guards do not support a non-default
+                                  scope; they always inspect the default (Messages)'
+                                rule: '!has(self.scope) || !has(self.webhook) || (self.scope.size()
+                                  == 1 && ''Messages'' in self.scope)'
                               - message: exactly one of the fields in [regex webhook
                                   bedrockGuardrails googleModelArmor] must be set
                                 rule: (has(self.regex)?1:0)+(has(self.webhook)?1:0)+(has(self.bedrockGuardrails)?1:0)+(has(self.googleModelArmor)?1:0)
@@ -13828,6 +13854,7 @@ spec:
                           - Realtime
                           - Rerank
                           - Responses
+                          - SystemOne
                           type: string
                         description: |-
                           Rules for identifying the type of traffic to handle.

@@ -95,7 +95,7 @@ impl StreamableHttpService {
 			},
 			// if we're not in stateful mode, we don't support GET or DELETE because there is no session
 			(http::Method::GET, true) => self.handle_get(request, inputs).await,
-			(http::Method::DELETE, true) => self.handle_delete(request, inputs).await,
+			(http::Method::DELETE, true) => Box::pin(self.handle_delete(request, inputs)).await,
 			_ => Err(ProxyError::MCP(mcp::Error::MethodNotAllowed)),
 		}
 	}
@@ -151,6 +151,7 @@ impl StreamableHttpService {
 				};
 			},
 		};
+		mcp::validate_client_message(&message)?;
 		let request_id = request_id(&message);
 		let protocol = validate_request_protocol(&part.headers, &message, request_id.clone())?;
 		validate_standard_headers(&part.headers, &message, &protocol)?;
@@ -265,19 +266,20 @@ impl StreamableHttpService {
 			return mcp::Error::InvalidAcceptGet.into();
 		}
 
-		let Some(session_id) = request
-			.headers()
+		let (parts, _) = request.into_parts();
+		let Some(session_id) = parts
+			.headers
 			.get(HEADER_SESSION_ID)
 			.and_then(|v| v.to_str().ok())
 		else {
 			return mcp::Error::SessionIdRequired.into();
 		};
 
-		let Some(session) = self.session_manager.get_session(session_id, inputs) else {
+		let ctx = crate::mcp::upstream::IncomingRequestContext::new(&parts);
+		let Some(session) = self.session_manager.get_session(session_id, inputs, &ctx) else {
 			return mcp::Error::UnknownSession.into();
 		};
 
-		let (parts, _) = request.into_parts();
 		session.get_stream(parts).await
 	}
 
@@ -301,8 +303,8 @@ impl StreamableHttpService {
 		Ok(
 			self
 				.session_manager
-				.delete_session(&inputs.backend_id, &session_id, parts)
-				.await
+				.delete_session(&session_id, inputs, parts)
+				.await?
 				.unwrap_or_else(accepted_response),
 		)
 	}

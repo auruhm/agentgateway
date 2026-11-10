@@ -10,7 +10,11 @@ use rmcp::model::{
 	ClientJsonRpcMessage, ClientNotification, ClientRequest, JsonRpcMessage, JsonRpcRequest,
 	RequestId, ServerJsonRpcMessage,
 };
-use rmcp::transport::{TokioChildProcess, Transport};
+use rmcp::transport::Transport;
+#[cfg(not(unix))]
+use rmcp::transport::TokioChildProcess;
+#[cfg(unix)]
+use super::stdio_child::GroupChild as TokioChildProcess;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, warn};
@@ -19,11 +23,19 @@ use crate::mcp::mergestream::Messages;
 use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
 
 pub struct Process {
+	worker_abort: tokio::task::AbortHandle,
 	sender: mpsc::Sender<(ClientJsonRpcMessage, IncomingRequestContext)>,
 	shutdown_tx: agent_core::responsechannel::Sender<(), Option<UpstreamError>>,
 	event_stream: AtomicOption<mpsc::Sender<ServerJsonRpcMessage>>,
 	pending_requests: Arc<Mutex<HashMap<RequestId, oneshot::Sender<ServerJsonRpcMessage>>>>,
 	alive: Arc<AtomicBool>,
+}
+
+impl Drop for Process {
+	fn drop(&mut self) {
+		// Даже заблокированный send не должен удерживать child после ухода владельца.
+		self.worker_abort.abort();
+	}
 }
 
 impl Process {
@@ -137,7 +149,7 @@ impl Process {
 		let alive = Arc::new(AtomicBool::new(true));
 		let alive_task = alive.clone();
 
-		tokio::spawn(async move {
+		let worker = tokio::spawn(async move {
 			let mut terminal_err = None;
 			let mut shutdown_resp = None;
 			let mut gateway_context: Option<IncomingRequestContext> = None;
@@ -228,6 +240,7 @@ impl Process {
 		});
 
 		Self {
+			worker_abort: worker.abort_handle(),
 			sender: sender_tx,
 			shutdown_tx,
 			event_stream,

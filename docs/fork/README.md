@@ -96,4 +96,4 @@ launchctl bootout gui/$UID/com.local.mcp-agw-comm ; launchctl bootstrap gui/$UID
   `2026-10-11-бриф-холстарт-форк-морфология.md`, `2026-10-13-обновление-софта-форки-и-вендор.md`.
 - Статус миграции и живая проба: `Projects/mcp_platform/research/AGENTGATEWAY_MIGRATION_STATUS_2026-10-07.md`,
   `…/AGENTGATEWAY_POC_2026-10-07.md`.
-- Стек и роадмап: `Projects/ai_tools/multi-har/ROADMAP.md`.
+- Стек и роадмап: `Projects/ai_tools/archive/multi-har/ROADMAP.md`.

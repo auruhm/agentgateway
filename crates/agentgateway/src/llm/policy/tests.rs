@@ -431,11 +431,18 @@ fn test_rejection_with_json_headers() {
 		status: StatusCode::BAD_REQUEST,
 		headers: Some(HeaderModifier {
 			set: vec![
-				(strng::new("content-type"), strng::new("application/json")),
-				(strng::new("x-custom-header"), strng::new("custom-value")),
+				(
+					::http::HeaderName::from_static("content-type"),
+					::http::HeaderValue::from_static("application/json"),
+				),
+				(
+					::http::HeaderName::from_static("x-custom-header"),
+					::http::HeaderValue::from_static("custom-value"),
+				),
 			],
 			add: vec![],
 			remove: vec![],
+			invalid: None,
 		}),
 	};
 
@@ -459,10 +466,17 @@ fn test_rejection_add_multiple_header_values() {
 		headers: Some(HeaderModifier {
 			set: vec![],
 			add: vec![
-				(strng::new("x-blocked-category"), strng::new("violence")),
-				(strng::new("x-blocked-category"), strng::new("hate")),
+				(
+					::http::HeaderName::from_static("x-blocked-category"),
+					::http::HeaderValue::from_static("violence"),
+				),
+				(
+					::http::HeaderName::from_static("x-blocked-category"),
+					::http::HeaderValue::from_static("hate"),
+				),
 			],
 			remove: vec![],
+			invalid: None,
 		}),
 	};
 
@@ -505,9 +519,13 @@ fn test_rejection_set_and_remove_headers() {
 		body: Bytes::from("test"),
 		status: StatusCode::BAD_REQUEST,
 		headers: Some(HeaderModifier {
-			set: vec![(strng::new("content-type"), strng::new("application/json"))],
+			set: vec![(
+				::http::HeaderName::from_static("content-type"),
+				::http::HeaderValue::from_static("application/json"),
+			)],
 			add: vec![],
-			remove: vec![strng::new("server")],
+			remove: vec![::http::header::SERVER],
+			invalid: None,
 		}),
 	};
 
@@ -1318,7 +1336,7 @@ fn bedrock_blocked_intervention_records_guardrail_info() {
 }
 
 #[test]
-fn bedrock_default_scope_skips_tool_texts_and_keeps_mask_aligned() {
+fn bedrock_scope_skips_tool_texts_and_keeps_mask_aligned() {
 	let mut req: crate::llm::types::completions::Request =
 		serde_json::from_value(serde_json::json!({
 			"model": "gpt-4o",
@@ -1330,7 +1348,7 @@ fn bedrock_default_scope_skips_tool_texts_and_keeps_mask_aligned() {
 		}))
 		.unwrap();
 
-	let (sent, in_scope) = Policy::scoped_request_texts(&mut req, &default_content_scope());
+	let (sent, in_scope) = Policy::scoped_request_texts(&mut req, &message_scopes());
 	assert_eq!(sent, vec!["be helpful", "email jane@example.com please"]);
 	assert_eq!(in_scope, vec![true, false, true]);
 
@@ -2470,6 +2488,12 @@ fn ssn_only() -> Vec<RegexRule> {
 	}]
 }
 
+/// No tool content: only the system prompt and regular messages.
+#[cfg(test)]
+fn message_scopes() -> Vec<ContentScope> {
+	vec![ContentScope::SystemPrompt, ContentScope::Messages]
+}
+
 /// Opted in to also scanning tool call inputs and results.
 #[cfg(test)]
 fn all_scopes() -> Vec<ContentScope> {
@@ -2825,7 +2849,7 @@ fn run_apply_regex_response(
 	Expect::Unchanged
 )]
 // Gemini tool traffic: function args, a function response, and a code-execution round trip
-// all stay untouched under the default scope; system and visible text are still guarded.
+// all stay untouched without the tool scopes; system and visible text are still guarded.
 #[case::gemini_mask_tool_output_untouched(
 	ChatFmt::Gemini,
 	Action::Mask,
@@ -2878,7 +2902,7 @@ fn test_apply_regex_preserves_tool_structure(
 	#[case] input: serde_json::Value,
 	#[case] expected: Expect,
 ) {
-	let (action, actual) = run_apply_regex(fmt, action, rules, input);
+	let (action, actual) = run_apply_regex_scoped(fmt, action, rules, message_scopes(), input);
 	match expected {
 		Expect::Masked(expected) => {
 			assert_eq!(action, GuardrailAction::Mask);
@@ -3283,9 +3307,9 @@ fn responses_mcp_request() -> serde_json::Value {
 		]
 	}))
 )]
-#[case::anthropic_mcp_untouched_by_default(
+#[case::anthropic_mcp_untouched_without_tool_scopes(
 	ChatFmt::Anthropic,
-	default_content_scope(),
+	message_scopes(),
 	anthropic_mcp_request(),
 	Expect::Unchanged
 )]
@@ -3329,9 +3353,9 @@ fn responses_mcp_request() -> serde_json::Value {
 		]
 	}))
 )]
-#[case::completions_legacy_function_untouched_by_default(
+#[case::completions_legacy_function_untouched_without_tool_scopes(
 	ChatFmt::Completions,
-	default_content_scope(),
+	message_scopes(),
 	completions_legacy_function_request(),
 	Expect::Unchanged
 )]
@@ -3359,9 +3383,9 @@ fn responses_mcp_request() -> serde_json::Value {
 		]
 	}))
 )]
-#[case::responses_mcp_untouched_by_default(
+#[case::responses_mcp_untouched_without_tool_scopes(
 	ChatFmt::Responses,
-	default_content_scope(),
+	message_scopes(),
 	responses_mcp_request(),
 	Expect::Unchanged
 )]
@@ -3403,20 +3427,31 @@ fn prompt_guard_scope_support() {
 	// claiming tool coverage on a guard that only ever sees message text must fail validation
 	let err = serde_json::from_value::<PromptGuard>(serde_json::json!({
 		"request": [{
-			"openAIModeration": {},
+			"webhook": {"target": {"host": "localhost:8080"}},
 			"scope": ["messages", "toolInput"],
 		}]
 	}))
 	.unwrap()
 	.validate()
 	.unwrap_err();
-	assert!(err.to_string().contains("non-default scope"), "{err}");
+	assert!(err.to_string().contains("do not support scope"), "{err}");
 
-	// spelling out the default is honest, in any order
+	// omitting scope, or spelling out what webhooks inspect (in any order), is honest
+	for scope in [None, Some(serde_json::json!(["messages", "systemPrompt"]))] {
+		let mut guard = serde_json::json!({"webhook": {"target": {"host": "localhost:8080"}}});
+		if let Some(scope) = scope {
+			guard["scope"] = scope;
+		}
+		serde_json::from_value::<PromptGuard>(serde_json::json!({"request": [guard]}))
+			.unwrap()
+			.validate()
+			.unwrap();
+	}
+
 	serde_json::from_value::<PromptGuard>(serde_json::json!({
 		"request": [{
 			"openAIModeration": {},
-			"scope": ["messages", "systemPrompt"],
+			"scope": ["messages", "toolOutput"],
 		}]
 	}))
 	.unwrap()
@@ -4106,10 +4141,11 @@ fn signed_response_text_is_scanned_but_never_masked(#[case] fmt: ChatFmt, #[case
 
 #[test]
 fn bedrock_signed_response_mask_rejects_without_changing_signed_text() {
+	use crate::llm::types::messages::typed::MessagesResponse;
+
 	let input = include_str!("../../../../llm/src/tests/response/anthropic/thinking.json");
 	for mask_signed in [false, true] {
-		let mut resp: crate::llm::types::messages::typed::MessagesResponse =
-			serde_json::from_str(input).unwrap();
+		let mut resp: MessagesResponse = serde_json::from_str(input).unwrap();
 		let original = serde_json::to_value(&resp).unwrap();
 		let (texts, in_scope) = Policy::scoped_response_texts(&mut resp, &default_response_scope());
 		let masked: Vec<_> = texts

@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::fmt::Debug;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -34,8 +33,8 @@ use crate::cel::{ContextBuilder, Expression, LLMContext};
 use crate::http::substrate::ateattr;
 use crate::http::substrate::ateattr::{ResumeDisposition, RouteOutcome};
 use crate::http::{Request, health};
-use crate::llm::InputFormat;
 use crate::llm::catalog::{CostLookupStatus, ModelCatalog};
+use crate::llm::{DetectedOperation, InputFormat};
 use crate::mcp::{MCPInfo, MCPOperation};
 use crate::proxy::{ProxyResponseReason, dtrace};
 use crate::telemetry::metrics::{
@@ -1349,7 +1348,7 @@ pub struct RequestLog {
 	pub a2a_method: Option<Strng>,
 	pub a2a_response: Option<a2a::ResponseInfo>,
 
-	pub inference_pool: Option<SocketAddr>,
+	pub inference_pool: Option<Target>,
 
 	pub ate_actor_name: Option<String>,
 	pub ate_actor_uid: Option<String>,
@@ -1389,10 +1388,23 @@ fn gen_ai_operation_name(input_format: InputFormat) -> &'static str {
 		// These operations have no standard GenAI operation name. Keep the custom values bounded.
 		InputFormat::Realtime => "realtime",
 		InputFormat::Rerank => "rerank",
-		InputFormat::Decisions => "decisions",
+		InputFormat::Decisions | InputFormat::SystemOne => "decisions",
 		InputFormat::CountTokens | InputFormat::GeminiCountTokens => "count_tokens",
-		// Detection has not identified the operation; do not assume it is chat.
-		InputFormat::Detect => "unknown",
+		InputFormat::Detect(Some(operation)) => match operation {
+			DetectedOperation::Chat => "chat",
+			DetectedOperation::GenerateContent => "generate_content",
+			DetectedOperation::Embeddings => "embeddings",
+			DetectedOperation::CountTokens => "count_tokens",
+			DetectedOperation::Rerank => "rerank",
+			DetectedOperation::Decisions => "decisions",
+			DetectedOperation::Image => "image_generation",
+			DetectedOperation::Ocr => "ocr",
+			DetectedOperation::Compaction => "compaction",
+			DetectedOperation::Transcription => "transcription",
+			DetectedOperation::Speech => "speech",
+		},
+		// The path is not a known serving endpoint; do not assume it is chat.
+		InputFormat::Detect(None) => "unknown",
 	}
 }
 
@@ -1611,7 +1623,11 @@ impl Drop for DropOnLog {
 					|| log
 						.listener_name
 						.as_ref()
-						.is_some_and(|listener| listener.listener_name.as_str() == llm::LOCAL_LISTENER_NAME));
+						.is_some_and(|listener| listener.listener_name.as_str() == llm::LOCAL_LISTENER_NAME)
+					|| log
+						.route_name
+						.as_ref()
+						.is_some_and(|route| route.name.as_str() == llm::LOCAL_ROUTE_NAME));
 			if !maybe_enable_log && !enable_trace && !log_store_enabled && !otlp_log_enabled {
 				return;
 			}
@@ -1637,7 +1653,7 @@ impl Drop for DropOnLog {
 			let usage_cost_total = cost.map(|b| b.total().to_string());
 			let trace_cost_fields = if enable_trace {
 				cost.map(|b| {
-					[
+					let mut fields = vec![
 						("agw.ai.usage.cost.input", b.input.to_string()),
 						("agw.ai.usage.cost.output", b.output.to_string()),
 						("agw.ai.usage.cost.cache_read", b.cache_read.to_string()),
@@ -1646,7 +1662,24 @@ impl Drop for DropOnLog {
 						("agw.ai.usage.cost.input_audio", b.input_audio.to_string()),
 						("agw.ai.usage.cost.output_audio", b.output_audio.to_string()),
 						("agw.ai.usage.cost.pages", b.pages.to_string()),
-					]
+						(
+							"agw.ai.usage.cost.audio_duration",
+							b.audio_duration.to_string(),
+						),
+					];
+					fields.extend(
+						[
+							("agw.ai.usage.cost.cache_write_details.1h", b.cache_write_1h),
+							(
+								"agw.ai.usage.cost.cache_write_details.12h",
+								b.cache_write_12h,
+							),
+						]
+						.into_iter()
+						.filter(|(_, v)| !v.is_zero())
+						.map(|(k, v)| (k, v.to_string())),
+					);
+					fields
 				})
 			} else {
 				None
@@ -1926,6 +1959,14 @@ impl Drop for DropOnLog {
 						.and_then(|l| l.output_audio_tokens)
 						.map(Into::into),
 				),
+				// Not part of official semconv
+				(
+					"gen_ai.usage.audio_seconds",
+					llm_response
+						.as_ref()
+						.and_then(|l| l.audio_seconds)
+						.map(Into::into),
+				),
 				(
 					"gen_ai.request.temperature",
 					log
@@ -2168,11 +2209,24 @@ impl Drop for DropOnLog {
 							("agw.ai.usage.cost.inputAudio", cost.input_audio),
 							("agw.ai.usage.cost.outputAudio", cost.output_audio),
 							("agw.ai.usage.cost.pages", cost.pages),
+							("agw.ai.usage.cost.audioDuration", cost.audio_duration),
 						];
-						db_kv.reserve(cost_raws.len());
-						for (k, v) in &cost_raws {
+						let cache_write_details = [
+							(
+								"agw.ai.usage.cost.cacheWriteDetails.1h",
+								cost.cache_write_1h,
+							),
+							(
+								"agw.ai.usage.cost.cacheWriteDetails.12h",
+								cost.cache_write_12h,
+							),
+						]
+						.into_iter()
+						.filter(|(_, v)| !v.is_zero());
+						db_kv.reserve(cost_raws.len() + 2);
+						for (k, v) in cost_raws.into_iter().chain(cache_write_details) {
 							let eval = v.to_f64().map(ValueBag::from_f64);
-							db_kv.push((*k, eval));
+							db_kv.push((k, eval));
 						}
 					}
 					let attributes = database_attributes(&db_kv);
@@ -2208,6 +2262,21 @@ impl Drop for DropOnLog {
 						input_tokens: u64_to_i64(input_tokens),
 						output_tokens: u64_to_i64(llm_response.as_ref().and_then(|llm| llm.output_tokens)),
 						total_tokens: u64_to_i64(total_tokens),
+						cache_read_input_tokens: u64_to_i64(
+							llm_response
+								.as_ref()
+								.and_then(|llm| llm.cached_input_tokens),
+						),
+						cache_creation_input_tokens: u64_to_i64(
+							llm_response
+								.as_ref()
+								.and_then(|llm| llm.cache_creation_input_tokens),
+						),
+						reasoning_tokens: u64_to_i64(
+							llm_response.as_ref().and_then(|llm| llm.reasoning_tokens),
+						),
+						time_to_first_token_ms: time_to_first_token.map(|seconds| seconds * 1000.0),
+						time_per_output_token_ms: time_per_output_token.map(|seconds| seconds * 1000.0),
 						cost: cost.and_then(|cost| cost.total().to_f64()),
 						agentgateway_user: attributes.agentgateway_user,
 						agentgateway_group: attributes.agentgateway_group,
@@ -3091,6 +3160,59 @@ mod tests {
 	}
 
 	#[test]
+	fn grpc_refusal_by_the_proxy_logs_its_grpc_status() {
+		use crate::http::jwt::TokenError;
+		use crate::proxy::ProxyError;
+		use crate::proxy::httpproxy::{resolve_response, set_final_response_fields};
+
+		let refusal = || {
+			Err(ProxyError::JwtAuthenticationFailure(TokenError::UnknownKeyId("rotated".into())).into())
+		};
+
+		let mut log = test_request_log();
+		let (mut response, reason) = resolve_response(refusal(), &mut log, true);
+		set_final_response_fields(&mut log, &reason, &mut response);
+		assert_eq!(response.status(), http::StatusCode::OK);
+		assert_eq!(
+			log.grpc_status.load(),
+			Some(tonic::Code::Unauthenticated as u8)
+		);
+
+		let mut log = test_request_log();
+		log.grpc_status.store(Some(tonic::Code::Internal as u8));
+		let (mut response, reason) = resolve_response(refusal(), &mut log, false);
+		set_final_response_fields(&mut log, &reason, &mut response);
+		assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+		assert_eq!(log.grpc_status.load(), None);
+	}
+
+	#[test]
+	fn mcp_authorization_denial_sets_internal_error_context() {
+		use crate::mcp;
+		use crate::proxy::ProxyError;
+		use crate::proxy::httpproxy::resolve_response;
+
+		let error = ProxyError::MCP(mcp::Error::Authorization(
+			rmcp::model::RequestId::Number(7),
+			"tool".to_string(),
+			"private-item".to_string(),
+		));
+		let mut log = test_request_log();
+		let (response, reason) = resolve_response(Err(error.into()), &mut log, false);
+		let detail = "mcp: authorization denied for tool: private-item";
+		assert_eq!(reason, ProxyResponseReason::Authorization);
+		assert_eq!(log.reason, Some(ProxyResponseReason::Authorization));
+		assert_eq!(log.error.as_deref(), Some(detail));
+		let context = response
+			.extensions()
+			.get::<crate::cel::ProxyContext>()
+			.unwrap();
+		let error = context.error.as_ref().unwrap();
+		assert_eq!(error.reason, "Authorization");
+		assert_eq!(error.message, detail);
+	}
+
+	#[test]
 	fn gen_ai_duration_preserves_response_failures_and_snapshot_metadata() {
 		use crate::http::transformation_cel::TransformationMetadata;
 		use crate::proxy::httpproxy::{resolve_response, set_final_response_fields};
@@ -3223,7 +3345,8 @@ mod tests {
 			(InputFormat::Decisions, "decisions"),
 			(InputFormat::CountTokens, "count_tokens"),
 			(InputFormat::GeminiCountTokens, "count_tokens"),
-			(InputFormat::Detect, "unknown"),
+			(InputFormat::Detect(None), "unknown"),
+			(InputFormat::Detect(Some(DetectedOperation::Chat)), "chat"),
 		] {
 			for streaming in [false, true] {
 				for has_response in [false, true] {

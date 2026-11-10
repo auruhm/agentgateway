@@ -77,6 +77,7 @@ impl Request {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StreamOptions {
 	/// If set, an additional chunk will be streamed before the `data: [DONE]` message. The `usage` field on this chunk shows the token usage statistics for the entire request, and the `choices` field will always be an empty array. All other chunks will also include a `usage` field, but with a null value.
+	#[serde(default)]
 	pub include_usage: bool,
 
 	#[serde(flatten, default)]
@@ -179,6 +180,9 @@ impl ResponseType for Response {
 		};
 
 		LLMResponse {
+			cache_creation_1h_input_tokens: None,
+			cache_creation_12h_input_tokens: None,
+			usage_lines: Vec::new(),
 			input_tokens: self.usage.as_ref().map(|u| u.prompt_tokens as u64),
 			input_image_tokens: None,
 			input_text_tokens: None,
@@ -199,6 +203,7 @@ impl ResponseType for Response {
 
 			total_tokens: self.usage.as_ref().map(|u| u.total_tokens as u64),
 			pages: None,
+			audio_seconds: None,
 			count_tokens: None,
 
 			reasoning_tokens: self.usage.as_ref().and_then(|u| {
@@ -670,8 +675,7 @@ pub mod typed {
 	#[allow(deprecated_in_future)]
 	pub use async_openai::types::chat::{
 		ChatCompletionAudio, ChatCompletionFunctionCall, ChatCompletionFunctions,
-		ChatCompletionMessageToolCall as MessageToolCall, ChatCompletionMessageToolCallChunk,
-		ChatCompletionMessageToolCalls as MessageToolCalls,
+		ChatCompletionMessageCustomToolCall, ChatCompletionMessageToolCallChunk,
 		ChatCompletionNamedToolChoice as NamedToolChoice,
 		ChatCompletionRequestAssistantMessageAudio as RequestAssistantMessageAudio,
 		ChatCompletionRequestAssistantMessageContent as RequestAssistantMessageContent,
@@ -700,6 +704,53 @@ pub mod typed {
 		ToolChoiceOptions, WebSearchOptions,
 	};
 	use serde::{Deserialize, Serialize};
+
+	#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq)]
+	pub struct MessageToolCall {
+		pub id: String,
+		pub function: FunctionCall,
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		pub extra_content: Option<ExtraContent>,
+	}
+
+	#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq)]
+	pub struct ExtraContent {
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		pub google: Option<GoogleExtraContent>,
+	}
+
+	#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq)]
+	pub struct GoogleExtraContent {
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		pub thought_signature: Option<String>,
+	}
+
+	impl MessageToolCall {
+		pub fn thought_signature(&self) -> Option<&str> {
+			self
+				.extra_content
+				.as_ref()?
+				.google
+				.as_ref()?
+				.thought_signature
+				.as_deref()
+		}
+
+		pub fn set_thought_signature(&mut self, signature: String) {
+			self.extra_content = Some(ExtraContent {
+				google: Some(GoogleExtraContent {
+					thought_signature: Some(signature),
+				}),
+			});
+		}
+	}
+
+	#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+	#[serde(tag = "type", rename_all = "snake_case")]
+	pub enum MessageToolCalls {
+		Function(MessageToolCall),
+		Custom(ChatCompletionMessageCustomToolCall),
+	}
 
 	/// Agentgateway fork of async-openai's `ChatCompletionRequestMessage`.
 	///
@@ -774,7 +825,7 @@ pub mod typed {
 		pub usage: Option<Usage>,
 	}
 
-	#[derive(Debug, Deserialize, Clone, Serialize)]
+	#[derive(Default, Debug, Deserialize, Clone, Serialize)]
 	pub struct UsageCompletionDetails {
 		pub reasoning_tokens: Option<u64>,
 		#[serde(skip_serializing_if = "Option::is_none")]
@@ -783,7 +834,7 @@ pub mod typed {
 		pub rest: serde_json::Value,
 	}
 
-	#[derive(Debug, Deserialize, Clone, Serialize)]
+	#[derive(Default, Debug, Deserialize, Clone, Serialize)]
 	pub struct UsagePromptDetails {
 		pub cached_tokens: Option<u64>,
 		#[serde(skip_serializing_if = "Option::is_none")]
@@ -792,6 +843,23 @@ pub mod typed {
 		pub cache_write_tokens: Option<u64>,
 		#[serde(flatten, default)]
 		pub rest: serde_json::Value,
+	}
+
+	impl UsagePromptDetails {
+		/// Omit the details only when neither cache count was reported.
+		pub fn from_cache_tokens(
+			cached_tokens: Option<u64>,
+			cache_write_tokens: Option<u64>,
+		) -> Option<Self> {
+			match (cached_tokens, cache_write_tokens) {
+				(None, None) => None,
+				(cached_tokens, cache_write_tokens) => Some(Self {
+					cached_tokens,
+					cache_write_tokens,
+					..Default::default()
+				}),
+			}
+		}
 	}
 
 	// Forked typed from OpenAI to include custom cache token details other providers use.
@@ -857,12 +925,8 @@ pub mod typed {
 		pub usage: Option<Usage>,
 	}
 
-	#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+	#[derive(Default, Debug, Deserialize, Serialize, Clone, PartialEq)]
 	pub struct ChatChoiceStream {
-		/// Fields outside the standard schema (engine extensions such as vLLM's `stop_reason` or SGLang's `matched_stop`),
-		/// preserved so conversions can read them.
-		#[serde(flatten, default)]
-		pub rest: serde_json::Value,
 		/// The index of the choice in the list of choices.
 		#[serde(default)]
 		pub index: u32,
@@ -886,6 +950,26 @@ pub mod typed {
 		/// Log probability information for the choice.
 		#[serde(skip_serializing_if = "Option::is_none")]
 		pub logprobs: Option<ChatChoiceLogprobs>,
+		/// Fields outside the standard schema (engine extensions such as vLLM's `stop_reason` or SGLang's `matched_stop`),
+		/// preserved so conversions can read them.
+		#[serde(flatten, default)]
+		pub rest: serde_json::Value,
+	}
+
+	impl ChatChoiceStream {
+		pub fn with_delta(delta: StreamResponseDelta) -> Self {
+			Self {
+				delta,
+				..Default::default()
+			}
+		}
+
+		pub fn with_finish_reason(finish_reason: FinishReason) -> Self {
+			Self {
+				finish_reason: Some(finish_reason),
+				..Default::default()
+			}
+		}
 	}
 
 	/// A chat completion delta generated by streamed model responses.
@@ -983,8 +1067,7 @@ pub mod typed {
 		/// LiteLLM: `reasoning_content` and `thinking_blocks` (https://docs.litellm.ai/docs/reasoning_content)
 		///
 		/// Since 3/4 of these use `reasoning_content`, it seems like a reasonable default.
-		/// Note: due to 'extra' below we still get other fields passed through, too; we just won't do anything
-		/// specific with them.
+		/// vLLM also uses `reasoning`; `reasoning()` reads either.
 		#[serde(skip_serializing_if = "Option::is_none")]
 		pub reasoning_content: Option<String>,
 
@@ -1293,6 +1376,67 @@ pub mod typed {
 				Some(Stop::StringArray(s)) => s.clone(),
 				_ => vec![],
 			}
+		}
+
+		/// Remove `extra_content` (Gemini thought signatures) from replayed tool calls,
+		/// for providers that would reject or mishandle the unknown field.
+		pub fn strip_tool_call_extra_content(&mut self) {
+			for message in &mut self.messages {
+				if let RequestMessage::Assistant(assistant) = message {
+					for call in assistant.tool_calls.iter_mut().flatten() {
+						if let MessageToolCalls::Function(call) = call {
+							call.extra_content = None;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	/// Reasoning text from `reasoning_content`, or `reasoning` (vLLM, OpenRouter).
+	fn reasoning_text<'a>(
+		reasoning_content: &'a Option<String>,
+		extra: &'a Option<serde_json::Value>,
+	) -> Option<&'a str> {
+		reasoning_content
+			.as_deref()
+			.filter(|s| !s.is_empty())
+			.or_else(|| extra.as_ref()?.get("reasoning")?.as_str())
+			.filter(|s| !s.is_empty())
+	}
+
+	impl ResponseMessage {
+		/// An empty assistant message.
+		#[allow(deprecated)]
+		pub fn assistant() -> Self {
+			Self {
+				content: None,
+				refusal: None,
+				tool_calls: None,
+				role: Role::Assistant,
+				function_call: None,
+				audio: None,
+				reasoning_content: None,
+				reasoning_signature: None,
+				extra: None,
+			}
+		}
+
+		pub fn reasoning(&self) -> Option<&str> {
+			reasoning_text(&self.reasoning_content, &self.extra)
+		}
+	}
+
+	impl StreamResponseDelta {
+		pub fn with_tool_calls(tool_calls: Vec<ChatCompletionMessageToolCallChunk>) -> Self {
+			Self {
+				tool_calls: Some(tool_calls),
+				..Default::default()
+			}
+		}
+
+		pub fn reasoning(&self) -> Option<&str> {
+			reasoning_text(&self.reasoning_content, &self.extra)
 		}
 	}
 }

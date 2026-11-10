@@ -121,7 +121,7 @@ func (r *ReportMap) BuildGWStatus(ctx context.Context, gw gwv1.Gateway, attached
 	// If any listeners are invalid, Gateway Accepted depends on whether at least one
 	// listener remains accepted.
 	if len(invalidListeners) > 0 {
-		message := fmt.Sprintf("Some listeners are not accepted: %s", strings.Join(invalidMessages, "; "))
+		message := fmt.Sprintf("Some listeners are not accepted: %s", strings.Join(slices.FilterDuplicates(invalidMessages), "; "))
 		if len(invalidMessages) == 0 {
 			message = fmt.Sprintf("Some listeners are not accepted: %s", strings.Join(invalidListeners, ", "))
 		}
@@ -211,6 +211,29 @@ func isGatewayBackendTLSResolvedRefsCondition(reason, message string) bool {
 }
 
 func handleInvalidAddresses(report *GatewayReport, g *gwv1.Gateway) {
+	clusterRoutable := 0
+	for _, addr := range g.Spec.Addresses {
+		switch addr.Routability {
+		case gwv1.GatewayAddressRoutabilityDefault:
+		case gwv1.GatewayAddressRoutabilityCluster:
+			clusterRoutable++
+		default:
+			report.SetCondition(reporter.GatewayCondition{
+				Type:    gwv1.GatewayConditionAccepted,
+				Status:  metav1.ConditionFalse,
+				Reason:  gwv1.GatewayReasonUnsupportedAddress,
+				Message: fmt.Sprintf("Unsupported address routability %q", addr.Routability),
+			})
+		}
+	}
+	if clusterRoutable > 0 && clusterRoutable != len(g.Spec.Addresses) {
+		report.SetCondition(reporter.GatewayCondition{
+			Type:    gwv1.GatewayConditionAccepted,
+			Status:  metav1.ConditionFalse,
+			Reason:  gwv1.GatewayReasonUnsupportedAddress,
+			Message: "Addresses with Cluster routability cannot be mixed with other routabilities",
+		})
+	}
 	for _, addr := range g.Spec.Addresses {
 		if addr.Type == nil {
 			continue

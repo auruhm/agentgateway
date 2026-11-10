@@ -55,7 +55,7 @@
 |`basicAuth.username`|string||
 |`llm`|object|`llm` contains attributes about an LLM request or response. This is only present when using an `ai` backend.|
 |`llm.streaming`|boolean|Whether the LLM response is streamed. If it is streamed some fields may be inconsistent based on when accessed during the response flow.|
-|`llm.requestModel`|string|The model requested for the LLM request. This may differ from the actual model used.|
+|`llm.requestModel`|string|The model requested for the LLM request. Before LLM processing, this is extracted from<br>the incoming URL or body, before provider overrides. This may differ from the actual model used.|
 |`llm.responseModel`|string|The model that actually served the LLM response.|
 |`llm.provider`|string|The provider of the LLM.|
 |`llm.inputTokens`|integer|The total number of tokens in the input/prompt, including tokens read from or written to<br>cache. This has consistent semantics across providers.|
@@ -63,6 +63,7 @@
 |`llm.inputImageTokens`|integer|The number of image tokens in the input/prompt.|
 |`llm.inputTextTokens`|integer|The number of text tokens in the input/prompt.<br>Note: this field is only set in multi-modal calls where the total token count is split out by<br>text/image/audio; for standard all-text calls, this is unset.|
 |`llm.inputAudioTokens`|integer|The number of audio tokens in the input/prompt.|
+|`llm.audioSeconds`|number|Seconds of input audio, for models billed by duration rather than tokens (such as `whisper-1`).|
 |`llm.cachedInputTokens`|integer|The number of tokens in the input/prompt read from cache (savings)|
 |`llm.cacheCreationInputTokens`|integer|Tokens written to cache (costs)|
 |`llm.outputTokens`|integer|The number of tokens in the output/completion.|
@@ -99,20 +100,52 @@
 |`llm.cost.output`|number||
 |`llm.cost.cacheRead`|number||
 |`llm.cost.cacheWrite`|number||
+|`llm.cost.cacheWriteDetails`|object||
+|`llm.cost.cacheWriteDetails.1h`|number||
+|`llm.cost.cacheWriteDetails.12h`|number||
 |`llm.cost.reasoning`|number||
 |`llm.cost.inputAudio`|number||
 |`llm.cost.outputAudio`|number||
 |`llm.cost.pages`|number||
+|`llm.cost.audioDuration`|number||
 |`llm.costRates`|object|Effective model catalog rates in USD per 1M tokens after tier selection.<br>Unset when the model could not be priced.|
 |`llm.costRates.input`|number||
 |`llm.costRates.output`|number||
 |`llm.costRates.cacheRead`|number||
 |`llm.costRates.cacheWrite`|number||
+|`llm.costRates.cacheWriteDetails`|object||
+|`llm.costRates.cacheWriteDetails.1h`|number||
+|`llm.costRates.cacheWriteDetails.12h`|number||
 |`llm.costRates.reasoning`|number||
 |`llm.costRates.inputAudio`|number||
 |`llm.costRates.outputAudio`|number||
 |`llm.costRates.perPage`|number||
-|`llmRequest`|any|`llmRequest` contains the raw LLM request before processing. This is only present *during* LLM policies;<br>policies occurring after the LLM policy, such as logs, will not have this field present even for LLM requests.|
+|`llm.costRates.perAudioMinute`|number||
+|`llm.model`|object|Model catalog metadata for the model that served the request.<br>Unset when the model is not in the catalog.|
+|`llm.model.id`|string|The catalog model ID the request resolved to.|
+|`llm.model.name`|string|Human-readable display name.|
+|`llm.model.status`|string|Lifecycle stage (alpha, beta, deprecated); absent means generally available.|
+|`llm.model.released`|string|Release date, as YYYY-MM-DD or YYYY-MM.|
+|`llm.model.tags`|[]string|Freeform capability/routing tags for this model.|
+|`llm.model.limits`|object|Token limits.|
+|`llm.model.limits.context`|integer|Total context window, shared by input and output.|
+|`llm.model.limits.input`|integer|Maximum input tokens, when tighter than the context window allows.|
+|`llm.model.limits.output`|integer|Maximum output tokens.|
+|`llm.model.modalities`|object|Supported input and output modalities.|
+|`llm.model.modalities.input`|[]string|Input modalities, such as text, image, pdf, audio, or video.|
+|`llm.model.modalities.output`|[]string|Output modalities, such as text, image, audio, or video.|
+|`llm.model.capabilities`|object|Supported features. Absent fields are unknown.|
+|`llm.model.capabilities.reasoning`|boolean|Whether the model supports reasoning.|
+|`llm.model.capabilities.structuredOutput`|boolean|Whether the model supports JSON Schema structured outputs.|
+|`llm.model.capabilities.toolCall`|boolean|Whether the model supports tool calling.|
+|`llm.model.capabilities.temperature`|boolean|Whether the model accepts the temperature parameter.|
+|`llm.model.reasoning`|object|How reasoning can be controlled.|
+|`llm.model.reasoning.toggle`|boolean|Whether reasoning can be turned on and off.|
+|`llm.model.reasoning.effort`|[]string|Accepted effort levels.|
+|`llm.model.reasoning.budgetTokens`|object|Accepted reasoning token budget range.|
+|`llm.model.reasoning.budgetTokens.min`|integer|Minimum reasoning token budget.|
+|`llm.model.reasoning.budgetTokens.max`|integer|Maximum reasoning token budget.|
+|`llmRequest`|any|`llmRequest` contains the raw JSON LLM request during route and LLM policies.<br>Policies occurring after LLM processing, such as logs, will not have this field present.|
 |`source`|object|`source` contains attributes about the source of the request.|
 |`source.address`|string|The IP address of the downstream connection.|
 |`source.port`|integer|The port of the downstream connection.|

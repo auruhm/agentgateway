@@ -236,24 +236,34 @@ impl OidcPolicy {
 			return Ok(PolicyResponse::default());
 		}
 
+		let is_login_path = self
+			.login
+			.as_ref()
+			.is_some_and(|login| req.uri().path() == login.path);
 		let bearer = crate::http::auth::AuthorizationLocation::bearer_header();
-		if self.credentials == OidcCredentials::SessionOrBearer
+		let permissive = self.credentials == OidcCredentials::Permissive;
+		if !is_login_path
+			&& (self.credentials == OidcCredentials::SessionOrBearer || permissive)
 			&& let Some(token) = bearer.extract(req)
 		{
-			let claims = self
-				.provider
-				.id_token_validator
-				.validate_claims(&token)
-				.map_err(|e| {
+			match self.provider.id_token_validator.validate_claims(&token) {
+				Ok(claims) => {
+					if let Some(Value::String(sub)) = claims.inner.get("sub") {
+						log.jwt_sub = Some(sub.clone());
+					}
+					req.extensions_mut().insert(claims);
+					bearer.remove(req).map_err(|e| Error::Http(e.into()))?;
+					return Ok(PolicyResponse::default());
+				},
+				Err(e) if permissive => {
+					// The token may be valid for a later authentication policy; leave it in place.
+					debug!(error=%e, "ignoring invalid bearer id token in permissive mode");
+				},
+				Err(e) => {
 					debug!(error=%e, "rejected invalid bearer id token");
-					Error::AuthenticationRequired
-				})?;
-			if let Some(Value::String(sub)) = claims.inner.get("sub") {
-				log.jwt_sub = Some(sub.clone());
+					return Err(Error::AuthenticationRequired);
+				},
 			}
-			req.extensions_mut().insert(claims);
-			bearer.remove(req).map_err(|e| Error::Http(e.into()))?;
-			return Ok(PolicyResponse::default());
 		}
 
 		let mut clear_refresh_cookie = false;
@@ -338,7 +348,10 @@ impl OidcPolicy {
 			.login
 			.as_ref()
 			.and_then(|login| login.redirect.as_deref());
-		let mut response = if non_navigation {
+		let mut response = if permissive && !is_login_path && !is_browser_navigation(req) {
+			// Only browser navigations enter login; other requests continue to later policies.
+			PolicyResponse::default()
+		} else if non_navigation {
 			if !clear_refresh_cookie && login_redirect.is_none() {
 				return Err(Error::AuthenticationRequired);
 			}
@@ -448,6 +461,27 @@ impl crate::store::RequestPolicyTrait for OidcPolicy {
 			.await
 			.map_err(|e| crate::proxy::ProxyResponse::from(crate::proxy::ProxyError::OidcFailure(e)))
 	}
+}
+
+/// Detects browser navigation. Fetch metadata is authoritative; `Accept` is the fallback when absent.
+fn is_browser_navigation(req: &Request) -> bool {
+	match req.headers().get("sec-fetch-mode") {
+		Some(mode) => mode == "navigate",
+		None => accepts_html(req),
+	}
+}
+
+/// Whether any `Accept` media range is `text/html`, ignoring parameters and case, across every
+/// `Accept` header line.
+fn accepts_html(req: &Request) -> bool {
+	req
+		.headers()
+		.get_all(header::ACCEPT)
+		.iter()
+		.filter_map(|accept| accept.to_str().ok())
+		.flat_map(|accept| accept.split(','))
+		.filter_map(|range| range.split(';').next())
+		.any(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"))
 }
 
 fn is_cors_preflight(req: &Request) -> bool {

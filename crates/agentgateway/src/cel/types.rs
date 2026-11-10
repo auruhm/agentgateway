@@ -60,7 +60,7 @@ pub struct Executor<'a> {
 	#[dynamic(rename = "basicAuth")]
 	pub basic_auth: ExtensionOrDirect<'a, basicauth::Claims>,
 
-	pub llm: ExtensionOrDirect<'a, LLMContext>,
+	pub llm: LLMView<'a>,
 
 	#[dynamic(rename = "llmRequest")]
 	pub llm_request: Option<&'a serde_json::Value>,
@@ -574,12 +574,21 @@ impl<'a> VariableResolver<'a> for ExecutorResolver<'a> {
 impl<'a> Executor<'a> {
 	fn set_request(&mut self, req: &'a crate::http::Request) {
 		self.request = Some(req.into());
+		self.llm_request = req
+			.body()
+			.extension::<crate::json::ParsedJson>()
+			.map(|body| &body.0);
 		self.set_request_extensions(req.extensions());
 	}
 	fn set_request_extensions(&mut self, ext: &'a Extensions) {
 		self.api_key = ExtensionOrDirect::Extension(ext);
 		self.jwt = ExtensionOrDirect::Extension(ext);
-		self.llm = ExtensionOrDirect::Extension(ext);
+		self.llm = match ext.get::<LLMContext>() {
+			Some(llm) => LLMView::Context(llm),
+			None => ext
+				.get::<RequestModel>()
+				.map_or(LLMView::None, LLMView::RequestModel),
+		};
 		self.mcp = ext.get::<MCPInfo>().map(MCPView::new);
 		self.basic_auth = ExtensionOrDirect::Extension(ext);
 		self.extauthz = ExtensionOrDirect::Extension(ext);
@@ -595,7 +604,7 @@ impl<'a> Executor<'a> {
 		self.request = Some(req.into());
 		self.api_key = ExtensionOrDirect::Direct(req.api_key.as_ref());
 		self.jwt = ExtensionOrDirect::Direct(req.jwt.as_ref());
-		self.llm = ExtensionOrDirect::Direct(req.llm.as_ref());
+		self.llm = req.llm.as_ref().into();
 		self.basic_auth = ExtensionOrDirect::Direct(req.basic_auth.as_ref());
 		self.extauthz = ExtensionOrDirect::Direct(req.extauthz.as_ref());
 		self.extproc = ExtensionOrDirect::Direct(req.extproc.as_ref());
@@ -610,7 +619,7 @@ impl<'a> Executor<'a> {
 		self.response = Some(resp.into());
 		self.proxy = ExtensionOrDirect::Extension(resp.extensions());
 		if let Some(llm) = resp.extensions().get::<LLMContext>() {
-			self.llm = ExtensionOrDirect::Direct(Some(llm));
+			self.llm = LLMView::Context(llm);
 		}
 		if let Some(extproc) = resp.extensions().get::<ExtProcDynamicMetadata>() {
 			self.extproc = ExtensionOrDirect::Direct(Some(extproc));
@@ -651,12 +660,6 @@ impl<'a> Executor<'a> {
 		this.llm_request = Some(llm_body);
 		this
 	}
-	pub fn new_llm_request(req: &'a crate::http::Request, llm_body: &'a serde_json::Value) -> Self {
-		let mut this = Self::new_empty();
-		this.set_request(req);
-		this.llm_request = Some(llm_body);
-		this
-	}
 	pub fn new_logger(
 		req: Option<&'a RequestSnapshot>,
 		resp: Option<&'a ResponseSnapshot>,
@@ -679,7 +682,7 @@ impl<'a> Executor<'a> {
 			response.body.recorded = resp.recorded_body.as_ref();
 			response.body_prefix = BodyPrefix(response.body.clone());
 		}
-		this.llm = ExtensionOrDirect::Direct(llm);
+		this.llm = llm.into();
 		this.mcp = mcp.map(MCPView::new);
 		this.guardrails = guardrails;
 		if let Some(proxy) = proxy {
@@ -698,7 +701,7 @@ impl<'a> Executor<'a> {
 		if let Some(req) = req {
 			this.set_request_snapshot(req);
 		}
-		this.llm = ExtensionOrDirect::Direct(Some(llm));
+		this.llm = LLMView::Context(llm);
 		this
 	}
 	pub fn new_tcp_logger(
@@ -1527,12 +1530,60 @@ impl GuardrailInfo {
 	}
 }
 
+/// The incoming request model, exposed as `llm.requestModel` before LLM processing.
+#[derive(Clone, Debug, cel::DynamicType)]
+pub struct RequestModel {
+	#[dynamic(rename = "requestModel")]
+	pub request_model: Strng,
+}
+
+#[derive(Debug, Default)]
+pub enum LLMView<'a> {
+	#[default]
+	None,
+	Context(&'a LLMContext),
+	RequestModel(&'a RequestModel),
+}
+
+impl<'a> From<Option<&'a LLMContext>> for LLMView<'a> {
+	fn from(value: Option<&'a LLMContext>) -> Self {
+		value.map_or(Self::None, Self::Context)
+	}
+}
+
+impl DynamicType for LLMView<'_> {
+	fn auto_materialize(&self) -> bool {
+		match self {
+			Self::None => true,
+			Self::Context(llm) => llm.auto_materialize(),
+			Self::RequestModel(model) => model.auto_materialize(),
+		}
+	}
+
+	fn materialize(&self) -> Value<'_> {
+		match self {
+			Self::None => Value::Null,
+			Self::Context(llm) => llm.materialize(),
+			Self::RequestModel(model) => model.materialize(),
+		}
+	}
+
+	fn field(&self, field: &str) -> Option<Value<'_>> {
+		match self {
+			Self::None => None,
+			Self::Context(llm) => llm.field(field),
+			Self::RequestModel(model) => model.field(field),
+		}
+	}
+}
+
 #[apply(schema!)]
 #[derive(cel::DynamicType)]
 pub struct LLMContext {
 	/// Whether the LLM response is streamed. If it is streamed some fields may be inconsistent based on when accessed during the response flow.
 	pub streaming: bool,
-	/// The model requested for the LLM request. This may differ from the actual model used.
+	/// The model requested for the LLM request. Before LLM processing, this is extracted from
+	/// the incoming URL or body, before provider overrides. This may differ from the actual model used.
 	#[dynamic(rename = "requestModel")]
 	pub request_model: Strng,
 	/// The model that actually served the LLM response.
@@ -1565,6 +1616,10 @@ pub struct LLMContext {
 	#[dynamic(rename = "inputAudioTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub input_audio_tokens: Option<u64>,
+	/// Seconds of input audio, for models billed by duration rather than tokens (such as `whisper-1`).
+	#[dynamic(rename = "audioSeconds")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub audio_seconds: Option<f64>,
 	/// The number of tokens in the input/prompt read from cache (savings)
 	#[dynamic(rename = "cachedInputTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -1653,6 +1708,10 @@ pub struct LLMContext {
 	#[dynamic(rename = "costRates")]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub cost_rates: Option<llm::catalog::CostRates>,
+	/// Model catalog metadata for the model that served the request.
+	/// Unset when the model is not in the catalog.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub model: Option<Arc<llm::catalog::ModelInfo>>,
 	#[serde(skip)]
 	#[dynamic(skip)]
 	pub cost_status: Option<llm::catalog::CostLookupStatus>,
@@ -1682,6 +1741,7 @@ impl LLMContext {
 			input_image_tokens: resp.input_image_tokens,
 			input_text_tokens: resp.input_text_tokens,
 			input_audio_tokens: resp.input_audio_tokens,
+			audio_seconds: resp.audio_seconds,
 			cached_input_tokens: resp.cached_input_tokens,
 			cache_creation_input_tokens: resp.cache_creation_input_tokens,
 			service_tier: resp
@@ -1726,6 +1786,7 @@ impl LLMContext {
 		if let Some(projection) = projection {
 			base.cost = projection.cost;
 			base.cost_rates = projection.cost_rates;
+			base.model = projection.model;
 			base.cost_status = Some(projection.status);
 		}
 
@@ -1794,12 +1855,14 @@ impl From<llm::LLMRequest> for LLMContext {
 			input_image_tokens: None,
 			input_text_tokens: None,
 			input_audio_tokens: None,
+			audio_seconds: None,
 			cached_input_tokens: None,
 			cache_creation_input_tokens: None,
 			service_tier: None,
 			cost: None,
 			cost_rates: None,
 			cost_status: None,
+			model: None,
 		}
 	}
 }
@@ -2228,8 +2291,8 @@ pub struct ExecutorSerde {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub llm: Option<LLMContext>,
 
-	/// `llmRequest` contains the raw LLM request before processing. This is only present *during* LLM policies;
-	/// policies occurring after the LLM policy, such as logs, will not have this field present even for LLM requests.
+	/// `llmRequest` contains the raw JSON LLM request during route and LLM policies.
+	/// Policies occurring after LLM processing, such as logs, will not have this field present.
 	#[serde(rename = "llmRequest", skip_serializing_if = "Option::is_none")]
 	pub llm_request: Option<serde_json::Value>,
 
@@ -2374,7 +2437,7 @@ impl ExecutorSerde {
 		exec.jwt = ExtensionOrDirect::Direct(self.jwt.as_ref());
 		exec.api_key = ExtensionOrDirect::Direct(self.api_key.as_ref());
 		exec.basic_auth = ExtensionOrDirect::Direct(self.basic_auth.as_ref());
-		exec.llm = ExtensionOrDirect::Direct(self.llm.as_ref());
+		exec.llm = self.llm.as_ref().into();
 		exec.backend = ExtensionOrDirect::Direct(self.backend.as_ref());
 		exec.extauthz = ExtensionOrDirect::Direct(self.extauthz.as_ref());
 		exec.extproc = ExtensionOrDirect::Direct(self.extproc.as_ref());
@@ -2509,6 +2572,7 @@ pub fn full_example_executor() -> ExecutorSerde {
 			input_image_tokens: Some(60),
 			input_text_tokens: Some(40),
 			input_audio_tokens: Some(5),
+			audio_seconds: None,
 			cached_input_tokens: Some(20),
 			cache_creation_input_tokens: Some(10),
 			output_tokens: Some(50),
@@ -2541,6 +2605,7 @@ pub fn full_example_executor() -> ExecutorSerde {
 			cost: None,
 			cost_rates: None,
 			cost_status: None,
+			model: None,
 		}),
 		mcp: Some(MCPInfo {
 			method_name: Some("tools/call".into()),
