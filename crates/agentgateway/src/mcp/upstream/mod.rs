@@ -23,9 +23,9 @@ use rmcp::model::{
 };
 #[cfg(not(unix))]
 use rmcp::transport::TokioChildProcess;
+use rmcp::transport::common::http_header::HEADER_SESSION_ID;
 #[cfg(unix)]
 use stdio_child::GroupChild as TokioChildProcess;
-use rmcp::transport::common::http_header::HEADER_SESSION_ID;
 use thiserror::Error;
 use tokio::process::Command;
 

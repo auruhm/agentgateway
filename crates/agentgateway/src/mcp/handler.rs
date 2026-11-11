@@ -264,25 +264,57 @@ fn inflect_match(token: &str, word: &str) -> bool {
 	common >= 3 && common + 2 >= shorter
 }
 
-/// Rank catalog tools against a free-text query: name hits weigh more than description hits.
-fn search_catalog(catalog: Vec<Tool>, query: &str, limit: usize) -> Vec<Tool> {
-	let tokens: Vec<String> = query
+/// Split text into name/search tokens on every non-alphanumeric separator, so that
+/// `windows_hub_native_status`, `windows_hub_native_status` and `windows hub native`
+/// produce the same token list.
+fn norm_tokens(text: &str) -> Vec<String> {
+	text
 		.to_lowercase()
-		.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+		.split(|c: char| !c.is_alphanumeric())
 		.filter(|t| !t.is_empty())
 		.map(|t| t.to_string())
-		.collect();
-	if tokens.is_empty() {
-		return Vec::new();
+		.collect()
+}
+
+/// Result of a catalog search: matching tools plus how many matched before `limit`.
+struct SearchResult {
+	total: usize,
+	matches: Vec<Tool>,
+}
+
+/// Rank catalog tools against a free-text query: name hits weigh more than description hits.
+///
+/// Names are compared as token sequences, not literal substrings: a federated tool renamed to
+/// `windows_hub_native_status` must still be found by `native_status` or by its full original
+/// name. Exact and prefix/suffix token matches are scored far above partial ones so a tool can
+/// not be pushed out of the `limit` window by unrelated same-word tools.
+fn search_catalog(catalog: Vec<Tool>, query: &str, limit: usize) -> SearchResult {
+	let query_tokens = norm_tokens(query);
+	if query_tokens.is_empty() {
+		return SearchResult {
+			total: 0,
+			matches: Vec::new(),
+		};
 	}
-	let mut scored: Vec<(i64, Tool)> = catalog
+	let mut scored: Vec<(i64, usize, Tool)> = catalog
 		.into_iter()
 		.filter_map(|t| {
 			let name = t.name.to_lowercase();
+			let name_tokens = norm_tokens(&name);
 			let desc = t.description.as_deref().unwrap_or("").to_lowercase();
 			let desc_words = split_words(&desc);
 			let mut score = 0i64;
-			for tok in &tokens {
+			if name_tokens == query_tokens {
+				score += 1000;
+			} else if name_tokens.starts_with(&query_tokens) || name_tokens.ends_with(&query_tokens) {
+				score += 400;
+			} else if query_tokens
+				.iter()
+				.all(|q| name_tokens.iter().any(|n| n.contains(q.as_str())))
+			{
+				score += 200;
+			}
+			for tok in &query_tokens {
 				if name.contains(tok.as_str()) {
 					score += 10;
 				}
@@ -290,16 +322,28 @@ fn search_catalog(catalog: Vec<Tool>, query: &str, limit: usize) -> Vec<Tool> {
 					score += 2;
 				}
 			}
-			(score > 0).then_some((score, t))
+			(score > 0).then_some((score, name_tokens.len(), t))
 		})
 		.collect();
-	scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
-	scored.into_iter().take(limit).map(|(_, t)| t).collect()
+	scored.sort_by(|a, b| {
+		b.0
+			.cmp(&a.0)
+			.then_with(|| a.1.cmp(&b.1))
+			.then_with(|| a.2.name.cmp(&b.2.name))
+	});
+	let total = scored.len();
+	SearchResult {
+		total,
+		matches: scored.into_iter().take(limit).map(|(_, _, t)| t).collect(),
+	}
 }
 
 /// Render `mcp_search` matches as JSON so the caller gets each tool's full `inputSchema`.
-fn render_search_matches(query: &str, matches: &[Tool]) -> String {
-	let items: Vec<serde_json::Value> = matches
+/// `total`/`truncated` tell the caller when `limit` hid further matches and the query should be
+/// narrowed instead of assumed empty.
+fn render_search_matches(query: &str, result: &SearchResult) -> String {
+	let items: Vec<serde_json::Value> = result
+		.matches
 		.iter()
 		.map(|t| {
 			serde_json::json!({
@@ -312,6 +356,8 @@ fn render_search_matches(query: &str, matches: &[Tool]) -> String {
 	serde_json::to_string_pretty(&serde_json::json!({
 		"query": query,
 		"count": items.len(),
+		"total": result.total,
+		"truncated": result.total > items.len(),
 		"matches": items,
 	}))
 	.unwrap_or_else(|_| "{}".to_string())
@@ -1229,8 +1275,12 @@ impl Relay {
 		let upstreams = self.upstreams.clone();
 		Box::new(move |s, _cel| {
 			if upstreams.lazy_tools {
-				let mut discover =
-					Self::get_discovery(UpstreamNotifications::default(), Vec::new(), None, upstreams.server_overrides());
+				let mut discover = Self::get_discovery(
+					UpstreamNotifications::default(),
+					Vec::new(),
+					None,
+					upstreams.server_overrides(),
+				);
 				discover.capabilities = ServerCapabilities::builder().enable_tools().build();
 				return Ok(discover.into());
 			}
@@ -2723,13 +2773,49 @@ mod tests {
 			tool("db_inspect", "Show project status and health"),
 			tool("unrelated", "nothing to see here"),
 		];
-		let ranked = search_catalog(catalog, "status", 5);
+		let ranked = search_catalog(catalog, "status", 5).matches;
 		let names: Vec<String> = ranked.iter().map(|t| t.name.to_string()).collect();
 		assert_eq!(names.first().map(String::as_str), Some("project_status"));
 		assert!(names.contains(&"db_inspect".to_string()));
 		assert!(!names.contains(&"unrelated".to_string()));
 		// An empty query matches nothing rather than dumping the whole catalog.
-		assert!(search_catalog(vec![tool("x", "y")], "   ", 5).is_empty());
+		assert!(
+			search_catalog(vec![tool("x", "y")], "   ", 5)
+				.matches
+				.is_empty()
+		);
+	}
+
+	#[test]
+	fn search_catalog_finds_renamed_federated_tool() {
+		let tool = |name: &str, desc: &str| {
+			Tool::new_with_raw(
+				Cow::Owned(name.to_string()),
+				Some(Cow::Owned(desc.to_string())),
+				Arc::new(json!({ "type": "object" }).as_object().cloned().unwrap()),
+			)
+		};
+		// A federated tool is renamed with a server prefix; its original name survives as a token
+		// suffix. Same-word neighbours must not push it out of the limit window.
+		let catalog = || {
+			vec![
+				tool("windows-app/inventory", "Ручной inventory-only fallback"),
+				tool("windows-package/perform", "Операции с Windows-пакетом"),
+				tool("windows_hub_qa__qa_status", "QA status"),
+				tool("windows_hub_native_status", "Фактическая база и providers"),
+				tool("tc_app", "Приложение"),
+			]
+		};
+		let by_full = search_catalog(catalog(), "windows_native_status", 1);
+		assert_eq!(by_full.matches.len(), 1);
+		assert_eq!(by_full.matches[0].name, "windows_hub_native_status");
+		let by_source = search_catalog(catalog(), "native_status", 1);
+		assert_eq!(by_source.matches[0].name, "windows_hub_native_status");
+		// A capped result still reports how many tools matched in total.
+		let capped = search_catalog(catalog(), "windows", 2);
+		assert_eq!(capped.matches.len(), 2);
+		assert_eq!(capped.total, 4);
+		assert!(capped.total > capped.matches.len());
 	}
 
 	#[test]
@@ -2750,6 +2836,7 @@ mod tests {
 				tool("unrelated", "nothing to see here"),
 			];
 			search_catalog(catalog, query, 8)
+				.matches
 				.iter()
 				.map(|t| t.name.to_string())
 				.collect()
@@ -2817,9 +2904,17 @@ mod tests {
 					.unwrap(),
 			),
 		);
-		let rendered = render_search_matches("call", &[tool]);
+		let rendered = render_search_matches(
+			"call",
+			&SearchResult {
+				total: 3,
+				matches: vec![tool],
+			},
+		);
 		let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
 		assert_eq!(parsed["count"], 1);
+		assert_eq!(parsed["total"], 3);
+		assert_eq!(parsed["truncated"], true);
 		assert_eq!(parsed["matches"][0]["name"], "mcp_call");
 		assert_eq!(parsed["matches"][0]["inputSchema"]["type"], "object");
 	}

@@ -10,15 +10,15 @@ use rmcp::model::{
 	ClientJsonRpcMessage, ClientNotification, ClientRequest, JsonRpcMessage, JsonRpcRequest,
 	RequestId, ServerJsonRpcMessage,
 };
-use rmcp::transport::Transport;
 #[cfg(not(unix))]
 use rmcp::transport::TokioChildProcess;
-#[cfg(unix)]
-use super::stdio_child::GroupChild as TokioChildProcess;
+use rmcp::transport::Transport;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, warn};
 
+#[cfg(unix)]
+use super::stdio_child::GroupChild as TokioChildProcess;
 use crate::mcp::mergestream::Messages;
 use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
 

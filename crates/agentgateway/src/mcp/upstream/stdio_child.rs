@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use rmcp::RoleClient;
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
-use rmcp::transport::{Transport, async_rw::AsyncRwTransport};
+use rmcp::transport::Transport;
+use rmcp::transport::async_rw::AsyncRwTransport;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 pub struct GroupChild {

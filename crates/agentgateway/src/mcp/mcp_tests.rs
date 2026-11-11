@@ -32,6 +32,7 @@ use crate::*;
 #[tokio::test]
 async fn lazy_bootstrap_does_not_contact_slow_backend() {
 	use std::time::Duration;
+
 	use wiremock::matchers::method;
 	use wiremock::{Mock, ResponseTemplate};
 	for stateful in [false, true] {
